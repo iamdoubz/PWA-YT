@@ -1,38 +1,33 @@
 <script>
   import { onMount } from 'svelte';
   import * as db from './db.js';
+  import * as api from './api.js';
+  import { API } from './api.js';
   import { net } from './net.svelte.js';
 
-  // v0.0 has no server, so the catalogue is a constant. In v0.1 this comes from
-  // IndexedDB, populated by /items. What matters for this phase is that boot
-  // reads only local state — see the onMount below.
-  const CATALOGUE = [
-    {
-      id: 'chirp-3m',
-      title: 'Rising chirp (3 min)',
-      artist: 'Test fixture',
-      files: [
-        { role: 'audio', name: 'audio.m4a', url: '/media/chirp-3m.m4a' },
-        { role: 'art', name: 'art-sq.jpg', url: '/media/art-sq.jpg' },
-      ],
-    },
-    {
-      id: 'chirp-60m',
-      title: 'Rising chirp (60 min)',
-      artist: 'Test fixture',
-      files: [
-        { role: 'audio', name: 'audio.m4a', url: '/media/chirp-60m.m4a' },
-        { role: 'art', name: 'art-sq.jpg', url: '/media/art-sq.jpg' },
-      ],
-    },
-  ];
+  const ACTIVE = ['queued', 'fetching', 'transforming', 'ready'];
+  const STAGE = {
+    queued: 'queued',
+    fetching: 'downloading on server',
+    transforming: 'converting',
+    ready: 'sending to device',
+  };
 
+  let items = $state([]); // catalogue mirror, from IndexedDB
   let media = $state({}); // item_id -> local_media row
   let urls = $state({}); // item_id -> { audio, art } object URLs
-  let progress = $state({}); // item_id -> 0..1 while downloading
+  let jobs = $state({}); // item_id -> latest job
+  let progress = $state({}); // item_id -> 0..1 while pulling into OPFS
   let errors = $state({});
+
+  let urlInput = $state('');
+  let plan = $state(null);
+  let planError = $state(null);
+  let resolving = $state(false);
+
   let persisted = $state(null);
   let moveSupported = $state(null);
+  let mediaActions = $state({});
   let playingId = $state(null);
   let paused = $state(true);
   let at = $state(0);
@@ -42,30 +37,167 @@
   let audio; // ONE element for the app's lifetime. FM-5: a fresh element per
   // track loses the iOS gesture unlock and playback dies once backgrounded.
   let worker;
+  let poll = null;
+  const inFlight = new Set();
 
-  const playing = $derived(CATALOGUE.find((c) => c.id === playingId) ?? null);
+  const playing = $derived(items.find((i) => i.id === playingId) ?? null);
+  const downloaded = $derived(items.filter((i) => media[i.id]));
 
   onMount(async () => {
     // The boot path. Local reads only — no fetch, no await on anything that
     // could hang. FM-2 is the most commonly missed failure mode and it is
     // missed exactly here.
-    const rows = await db.all();
-    for (const row of rows) media[row.item_id] = row;
+    const [catalogue, local] = await Promise.all([db.all('items'), db.all('local_media')]);
+    items = catalogue.sort((a, b) => b.added_at.localeCompare(a.added_at));
+    for (const row of local) media[row.item_id] = row;
     booted = true;
 
     navigator.storage.persisted().then((v) => (persisted = v));
 
     // Object URLs are built for every downloaded item up front, not on click.
     // Reading OPFS is async, and awaiting it inside a click handler breaks the
-    // iOS user-gesture chain, so play() would be rejected. FM-5 calls this
-    // prefetching; with two items it is just "all of them".
-    for (const row of rows) resolveUrls(row);
+    // iOS user-gesture chain, so play() would be rejected.
+    //
+    // ponytail: read straight from OPFS rather than mirroring artwork into an
+    // IndexedDB blob store as FM-7 suggests. Both are local, this needs no
+    // second copy of the bytes, and it happens after first paint. Revisit at
+    // v0.2 when a sweep has thousands of items to open.
+    for (const row of local) resolveUrls(row);
 
     worker = new Worker(new URL('./opfs-worker.js', import.meta.url), { type: 'module' });
     worker.onmessage = onWorkerMessage;
 
     setupMediaSession();
+
+    // Optional, failable, and strictly after first paint.
+    queueMicrotask(() => startPolling());
   });
+
+  // ------------------------------------------------------------------ adding
+
+  async function doResolve() {
+    if (!urlInput.trim()) return;
+    resolving = true;
+    planError = null;
+    plan = null;
+    try {
+      plan = (await api.resolveUrl(urlInput.trim())).entry;
+    } catch (err) {
+      planError = err.message;
+    } finally {
+      resolving = false;
+    }
+  }
+
+  async function confirmAdd() {
+    const entry = plan;
+    plan = null;
+    try {
+      const created = (await api.createItem(entry.source_key)).items[0];
+      const row = {
+        id: created.item_id,
+        source_key: entry.source_key,
+        title: entry.title,
+        uploader: entry.uploader,
+        duration_s: entry.duration_s,
+        added_at: new Date().toISOString(),
+      };
+      await db.put('items', row);
+      items = [row, ...items.filter((i) => i.id !== row.id)];
+      urlInput = '';
+      startPolling();
+    } catch (err) {
+      planError = err.message;
+    }
+  }
+
+  // ------------------------------------------------------------------- jobs
+
+  function startPolling() {
+    if (poll) return;
+    // ponytail: polling, not SSE. GET /jobs/stream is v0.2 and needs progress
+    // values the worker does not report back yet. Two seconds is fine for a
+    // queue you can count on one hand.
+    poll = setInterval(pollJobs, 2000);
+    pollJobs();
+  }
+
+  function stopPolling() {
+    clearInterval(poll);
+    poll = null;
+  }
+
+  async function pollJobs() {
+    let data;
+    try {
+      data = await api.listJobs();
+    } catch {
+      stopPolling(); // offline, or no server. Neither is an error here.
+      return;
+    }
+
+    let busy = false;
+    for (const job of data.jobs) {
+      jobs[job.item_id] = job;
+      if (job.state === 'failed') errors[job.item_id] = job.error;
+      if (job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
+        pull(job);
+      }
+      if (ACTIVE.includes(job.state)) busy = true;
+    }
+    if (!busy && inFlight.size === 0) stopPolling();
+  }
+
+  function pull(job) {
+    inFlight.add(job.item_id);
+    progress[job.item_id] = 0;
+    errors[job.item_id] = null;
+    worker.postMessage({
+      itemId: job.item_id,
+      files: job.files.map((f) => ({ name: f.name, url: API + f.path })),
+    });
+  }
+
+  const roleOf = (name) =>
+    name.startsWith('audio') ? 'audio' : name.startsWith('art-sq') ? 'art' : 'art-full';
+
+  async function onWorkerMessage({ data }) {
+    if (data.type === 'progress') {
+      progress[data.itemId] = data.done / data.total;
+      return;
+    }
+
+    inFlight.delete(data.itemId);
+    progress[data.itemId] = undefined;
+
+    if (data.type === 'error') {
+      errors[data.itemId] = data.error;
+      return;
+    }
+
+    moveSupported = data.files.every((f) => f.moved);
+
+    // FM-4: the row claiming the file exists is the LAST thing written, after
+    // every byte is on disk and verified.
+    const row = {
+      item_id: data.itemId,
+      state: 'present',
+      files: data.files.map((f) => ({ role: roleOf(f.name), name: f.name, bytes: f.bytes })),
+      downloaded_at: new Date().toISOString(),
+    };
+    await db.put('local_media', row);
+    media[data.itemId] = row;
+
+    // The collection acknowledgement. Best-effort: if it fails the TTL reaper
+    // cleans up server-side, which is a backstop rather than the happy path.
+    const job = jobs[data.itemId];
+    if (job) api.acknowledge(job.id).catch(() => {});
+
+    // FM-6: ask once there is something worth keeping, and show the real
+    // answer — a silent false is how libraries disappear.
+    navigator.storage.persist().then((v) => (persisted = v));
+    resolveUrls(row);
+  }
 
   async function resolveUrls(row) {
     try {
@@ -80,62 +212,40 @@
       urls[row.item_id] = next;
     } catch (err) {
       // FM-6: the row claims the file exists and it does not. v0.2 downgrades
-      // the item to state 'missing' with a one-tap re-download; v0.0 just says so.
+      // the item to state 'missing' with a one-tap re-download.
       errors[row.item_id] = `not on disk: ${err}`;
     }
   }
 
-  function download(item) {
+  async function redownload(item) {
     errors[item.id] = null;
-    progress[item.id] = 0;
-    worker.postMessage({
-      itemId: item.id,
-      files: item.files.map(({ name, url }) => ({ name, url: new URL(url, location.origin).href })),
-    });
-  }
-
-  async function onWorkerMessage({ data }) {
-    const item = CATALOGUE.find((c) => c.id === data.itemId);
-    if (data.type === 'progress') {
-      progress[data.itemId] = data.done / data.total;
-      return;
+    try {
+      await api.createItem(item.source_key);
+      startPolling();
+    } catch (err) {
+      errors[item.id] = err.message;
     }
-    if (data.type === 'error') {
-      progress[data.itemId] = undefined;
-      errors[data.itemId] = data.error;
-      return;
-    }
-
-    progress[data.itemId] = undefined;
-    moveSupported = data.files.every((f) => f.moved);
-
-    // FM-4: the row claiming the file exists is the LAST thing written, after
-    // every byte is on disk and verified.
-    const row = {
-      item_id: data.itemId,
-      state: 'present',
-      files: data.files.map((f, i) => ({ role: item.files[i].role, name: f.name, bytes: f.bytes })),
-      downloaded_at: new Date().toISOString(),
-    };
-    await db.put(row);
-    media[data.itemId] = row;
-
-    // FM-6: ask once we actually have something worth keeping, and show the
-    // real answer — a silent false is how libraries disappear.
-    navigator.storage.persist().then((v) => (persisted = v));
-    resolveUrls(row);
   }
 
   async function forget(item) {
     for (const url of Object.values(urls[item.id] ?? {})) URL.revokeObjectURL(url);
     delete urls[item.id];
     if (playingId === item.id) stop();
-    const root = await navigator.storage.getDirectory();
-    const dir = await root.getDirectoryHandle('media');
-    await dir.removeEntry(item.id, { recursive: true });
-    await db.remove(item.id);
+
+    if (media[item.id]) {
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle('media');
+      await dir.removeEntry(item.id, { recursive: true }).catch(() => {});
+    }
+    await db.remove('local_media', item.id);
+    await db.remove('items', item.id);
     delete media[item.id];
+    items = items.filter((i) => i.id !== item.id);
+    // Offline-tolerant by accident, not by design. The outbox is v0.3.
+    api.deleteItem(item.id).catch(() => {});
   }
+
+  // ---------------------------------------------------------------- playback
 
   function play(item) {
     const url = urls[item.id]?.audio;
@@ -157,7 +267,6 @@
   }
 
   function step(delta) {
-    const downloaded = CATALOGUE.filter((c) => media[c.id]);
     if (!downloaded.length) return;
     const i = downloaded.findIndex((c) => c.id === playingId);
     play(downloaded[(i + delta + downloaded.length) % downloaded.length]);
@@ -167,18 +276,14 @@
     if (!('mediaSession' in navigator)) return;
     const art = urls[item.id]?.art;
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: item.title,
-      artist: item.artist,
+      title: item.title ?? 'Unknown',
+      artist: item.uploader ?? '',
       album: 'Library',
       // Must be a local object URL. A remote artwork URL blanks the lock screen
       // offline, which is the whole point of doing this at all.
       artwork: art ? [{ src: art, sizes: '512x512', type: 'image/jpeg' }] : [],
     });
   }
-
-  // Reported by the readiness panel: a handler Safari refuses is a lock-screen
-  // button that silently does nothing, and you only find out at 35,000 feet.
-  let mediaActions = $state({});
 
   function setupMediaSession() {
     if (!('mediaSession' in navigator)) return;
@@ -225,22 +330,17 @@
   let lastPush = 0;
   function onTimeUpdate() {
     at = audio.currentTime;
-    // timeupdate fires ~4x/s; the scrubber only needs ~1.
     if (performance.now() - lastPush > 1000) {
       lastPush = performance.now();
       pushPositionState();
     }
   }
 
-  function seek(e) {
-    audio.currentTime = Number(e.currentTarget.value);
-    pushPositionState();
-  }
-
   const clock = (s) =>
     Number.isFinite(s)
       ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
       : '–:––';
+  const mb = (b) => `${(b / 1e6).toFixed(1)} MB`;
 </script>
 
 <!-- The one long-lived audio element. Never recreated. -->
@@ -265,37 +365,79 @@
 ></audio>
 
 <main>
-  <h1>Tarmac <span class="ver">v0.0</span></h1>
+  <h1>Tarmac <span class="ver">v0.1</span></h1>
+
+  <form
+    class="add"
+    onsubmit={(e) => {
+      e.preventDefault();
+      doResolve();
+    }}
+  >
+    <input
+      type="url"
+      bind:value={urlInput}
+      placeholder="Paste a YouTube link"
+      aria-label="Media URL"
+    />
+    <button type="submit" disabled={resolving || !urlInput.trim()}>
+      {resolving ? 'Looking…' : 'Look up'}
+    </button>
+  </form>
+
+  {#if planError}
+    <p class="err">{planError}</p>
+  {/if}
+
+  {#if plan}
+    <!-- Stage 3: confirm. The user sees what it is and what it will cost
+         before anything is committed to their phone. -->
+    <section class="plan">
+      <strong>{plan.title}</strong>
+      <span class="dim">{plan.uploader} · {clock(plan.duration_s)}</span>
+      <span class="dim">~{mb(plan.estimated_bytes)} (estimate)</span>
+      {#if plan.already_in_library}
+        <span class="dim">Already in your library — this will re-download it.</span>
+      {/if}
+      <div class="actions">
+        <button onclick={confirmAdd}>Download</button>
+        <button class="ghost" onclick={() => (plan = null)}>Cancel</button>
+      </div>
+    </section>
+  {/if}
 
   {#if !booted}
     <p class="dim">Reading local catalogue…</p>
   {:else}
     <ul class="library">
-      {#each CATALOGUE as item (item.id)}
-        {@const row = media[item.id]}
+      {#each items as item (item.id)}
+        {@const job = jobs[item.id]}
         {@const pct = progress[item.id]}
         <li class:active={playingId === item.id}>
           <div class="art">
-            {#if urls[item.id]?.art}
-              <img src={urls[item.id].art} alt="" />
-            {/if}
+            {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
           </div>
           <div class="meta">
             <strong>{item.title}</strong>
-            <span class="dim">{item.artist}</span>
+            <span class="dim">{item.uploader} · {clock(item.duration_s)}</span>
             {#if errors[item.id]}<span class="err">{errors[item.id]}</span>{/if}
           </div>
           <div class="actions">
             {#if pct !== undefined}
               <span class="dim">{Math.round(pct * 100)}%</span>
-            {:else if row}
+            {:else if media[item.id]}
               <button onclick={() => play(item)}>Play</button>
               <button class="ghost" onclick={() => forget(item)}>Delete</button>
+            {:else if job && ACTIVE.includes(job.state)}
+              <span class="dim">{STAGE[job.state]}…</span>
             {:else}
-              <button onclick={() => download(item)}>Download</button>
+              <button onclick={() => redownload(item)}>Download</button>
+              <button class="ghost" onclick={() => forget(item)}>Delete</button>
             {/if}
           </div>
         </li>
+      {:else}
+        <li class="empty dim">Nothing here yet. Paste a link above.</li>
       {/each}
     </ul>
 
@@ -308,7 +450,10 @@
           max={duration || 0}
           value={at}
           step="0.1"
-          oninput={seek}
+          oninput={(e) => {
+            audio.currentTime = Number(e.currentTarget.value);
+            pushPositionState();
+          }}
           aria-label="Seek"
         />
         <div class="row">
@@ -324,10 +469,11 @@
       </section>
     {/if}
 
-    <!-- The probe results. This is what v0.0 exists to report. -->
     <section class="readiness">
       <h2>Offline readiness</h2>
       <dl>
+        <dt>Library</dt>
+        <dd>{items.length} items, {downloaded.length} downloaded</dd>
         <dt>Persistent storage</dt>
         <dd class:bad={persisted === false}>
           {persisted === null ? '…' : persisted ? 'granted' : 'DENIED'}
@@ -348,11 +494,11 @@
             .join(', ') || 'all registered'}
         </dd>
         <dt>Network calls</dt>
-        <dd class:bad={net.ok > 0}>{net.ok} ok / {net.fail} failed</dd>
+        <dd>{net.ok} ok / {net.fail} failed</dd>
       </dl>
       <p class="dim">
-        Assertion 12: after a cold boot in airplane mode, "ok" must read 0.
-        Counts main-thread fetch only.
+        Assertion 12: after a cold boot in airplane mode, with no downloads
+        started, "ok" must read 0. Counts main-thread fetch only.
       </p>
     </section>
   {/if}
@@ -361,8 +507,7 @@
 <style>
   /* ponytail: system font stack, so there is no font to self-host, subset,
      precache or forget to precache. The rule in docs is "no CDN fonts"; owning
-     zero font files satisfies it more completely than owning the right ones.
-     Revisit at v0.2 when the design actually asks for a typeface. */
+     zero font files satisfies it more completely than owning the right ones. */
   :global(body) {
     margin: 0;
     background: #0b0b0c;
@@ -373,7 +518,7 @@
   main {
     max-width: 34rem;
     margin: 0 auto;
-    padding: 1rem 1rem 6rem;
+    padding: 1rem 1rem 8rem;
   }
   h1 {
     font-size: 1.25rem;
@@ -400,6 +545,35 @@
   .bad {
     color: #ff8f8f;
   }
+  .add {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+  }
+  .add input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    padding: 0 0.75rem;
+    min-height: 44px;
+    border: 1px solid #33333a;
+    border-radius: 6px;
+    background: #16161a;
+    color: inherit;
+  }
+  .plan {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.75rem;
+    margin-bottom: 1rem;
+    background: #16161a;
+    border: 1px solid #33333a;
+    border-radius: 8px;
+  }
+  .plan .actions {
+    margin-top: 0.5rem;
+  }
   .library {
     list-style: none;
     padding: 0;
@@ -411,6 +585,9 @@
     align-items: center;
     padding: 0.6rem 0;
     border-bottom: 1px solid #232327;
+  }
+  .library li.empty {
+    border: 0;
   }
   .library li.active strong {
     color: #7fd1ff;
@@ -435,10 +612,16 @@
     min-width: 0;
     flex: 1;
   }
+  .meta strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .actions {
     display: flex;
     gap: 0.4rem;
     flex: none;
+    align-items: center;
   }
   button {
     font: inherit;
@@ -448,6 +631,9 @@
     border-radius: 6px;
     background: #2f6feb;
     color: #fff;
+  }
+  button:disabled {
+    opacity: 0.5;
   }
   button.ghost {
     background: #232327;

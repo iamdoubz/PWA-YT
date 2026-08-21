@@ -5,7 +5,21 @@ import { VitePWA } from 'vite-plugin-pwa';
 // Bind to 0.0.0.0 and accept any Host header so a cloudflared tunnel can reach
 // dev/preview. iOS gives you no OPFS, no service worker and no home-screen
 // install without real HTTPS, so the tunnel is not optional.
-const net = { host: true, allowedHosts: true };
+// Everything goes through one origin: the app and /api both come from Vite, so
+// there is no CORS and a cloudflared tunnel in front works without the client
+// knowing anything about it. That matters because the phone is tested through
+// exactly such a tunnel.
+const net = {
+  host: true,
+  allowedHosts: true,
+  proxy: {
+    '/api': {
+      target: 'http://127.0.0.1:8000',
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/api/, ''),
+    },
+  },
+};
 
 export default defineConfig({
   plugins: [
@@ -34,6 +48,9 @@ export default defineConfig({
         globPatterns: ['**/*.{js,css,html,ico,png,svg,webmanifest}'],
         globIgnores: ['media/**'],
         // navigateFallback defaults to index.html, which is what FM-1 requires.
+        // The denylist keeps the shell from ever being served in place of an
+        // API response — an offline /api call must fail, not return HTML.
+        navigateFallbackDenylist: [/^\/api\//],
       },
     }),
   ],

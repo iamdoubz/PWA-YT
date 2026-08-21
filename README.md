@@ -15,11 +15,40 @@ off — the app opens and plays.
 
 ## Status
 
-**Design complete. Nothing built yet.**
+**v0.1 built. Not yet verified on a physical device.**
 
-This repository currently contains a handoff specification only. If you are the
-session picking this up, start with **[`docs/00-HANDOFF.md`](docs/00-HANDOFF.md)**,
-then read `CLAUDE.md`.
+The pipeline runs end to end: paste a link, see what it is and what it will cost,
+download it, and play it back with both the API and the web server switched off.
+Verified on desktop Chrome. The device test protocol in
+`docs/02-offline-playback.md` — the one that actually decides whether this works
+— has **not** been run, and the seven-day soak has not been started.
+
+Start with **[`docs/00-HANDOFF.md`](docs/00-HANDOFF.md)**, then read `CLAUDE.md`.
+
+## Running it
+
+Two processes. The app proxies `/api` to the server, so everything is one origin
+— no CORS, and a tunnel in front of it works without configuration.
+
+```bash
+# terminal 1 — the stateless transformer
+cd server && uv run uvicorn main:app --port 8000
+
+# terminal 2 — the app
+cd app && npm install && npm run build && npm run preview -- --port 4173
+```
+
+Then open <http://localhost:4173>. Requires `ffmpeg` on `PATH`.
+
+```bash
+cd server && uv run python test_server.py   # server self-check
+cd app && npm run check:no-cdn              # fails if the shell gained a CDN reference
+```
+
+To test it the way it is meant to be used, put it on a phone over real HTTPS
+(`cloudflared tunnel --url http://localhost:4173`), add it to the home screen,
+then follow the protocol in `docs/02-offline-playback.md`. A localhost check with
+DevTools set to offline lies about iOS.
 
 ---
 
@@ -72,14 +101,16 @@ an inconvenience rather than data loss.
 | Media | yt-dlp as a library · ffmpeg · `bgutil-ytdlp-pot-provider` |
 | Auth | WebAuthn passkeys, magic-link fallback |
 
-## First task
+## Next task
 
-Build `v0.1` from [`docs/06-build-plan.md`](docs/06-build-plan.md) and nothing
-else. It is deliberately ugly and deliberately narrow, and it exists to answer
-the one question that invalidates everything else if the answer is bad:
+Put v0.1 on a physical iPhone and run the offline test protocol. Everything in
+v0.2 onward assumes a yes to the one question that invalidates the design if the
+answer is bad:
 
 > *Does a downloaded file survive on a real iPhone home-screen PWA, and play in
 > airplane mode, a week later, with the device low on free space?*
+
+Assertion 15 — the seven-day soak — is a wall clock. Start it early.
 
 ## Personal use
 

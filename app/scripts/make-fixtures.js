@@ -1,27 +1,16 @@
-// Generates the local media v0.0 pretends it downloaded. No network, no yt-dlp,
-// no server — the storage question does not care where the bytes came from.
+// Generates the PWA icons. Deliberately plain — v0.1 is meant to be ugly, and
+// a solid square is findable on a home screen, which is all the icon has to do.
 //
-// The audio is a rising chirp so you can hear roughly where you are in the file.
-// That is what makes assertions 4 and 7 (seek to 80%, play to the end without
-// truncation) checkable by ear on a phone with no debugger attached.
+// This used to generate chirp audio fixtures too, for the v0.0 probe that ran
+// without a server. The server exists now and supplies real media, so that half
+// was dead weight and went.
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 
 const out = new URL('../public/', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
-const media = `${out}media`;
-mkdirSync(media, { recursive: true });
-
-const chirp = (seconds) =>
-  `aevalsrc=0.3*sin(2*PI*(200+600*t/${seconds})*t):d=${seconds}:s=44100`;
 
 const jobs = [
-  ['chirp-3m.m4a', ['-f', 'lavfi', '-i', chirp(180),
-    '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', `${media}/chirp-3m.m4a`]],
-  ['chirp-60m.m4a', ['-f', 'lavfi', '-i', chirp(3600),
-    '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', `${media}/chirp-60m.m4a`]],
-  ['art-sq.jpg', ['-f', 'lavfi', '-i', 'testsrc2=s=512x512',
-    '-frames:v', '1', '-q:v', '3', `${media}/art-sq.jpg`]],
   ['icon-512.png', ['-f', 'lavfi', '-i', 'color=c=0x2f6feb:s=512x512',
     '-frames:v', '1', `${out}icon-512.png`]],
   ['icon-192.png', ['-f', 'lavfi', '-i', 'color=c=0x2f6feb:s=192x192',
@@ -29,8 +18,7 @@ const jobs = [
 ];
 
 for (const [name, args] of jobs) {
-  const dest = args[args.length - 1];
-  if (existsSync(dest)) {
+  if (existsSync(args[args.length - 1])) {
     console.log(`skip  ${name} (exists)`);
     continue;
   }

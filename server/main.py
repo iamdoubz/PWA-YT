@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -369,28 +369,27 @@ def delete_item(item_id: str):
     return {"ok": True}
 
 
-def _job_json(row, request: Request) -> dict:
+def _job_json(row) -> dict:
     files = json.loads(row["artifact_manifest"]) if row["artifact_manifest"] else []
-    base = str(request.base_url).rstrip("/")
     return {
         "id": row["id"],
         "item_id": row["item_id"],
         "state": row["state"],
         "stage_detail": row["stage_detail"],
         "error": row["error"],
+        # Paths are relative: the server owns the shape, the client owns the
+        # origin. An absolute URL built from request.base_url would name the
+        # server's own host and so bypass the dev proxy and any tunnel in front
+        # of it — which is precisely the setup the phone is tested through.
         "files": [
-            {
-                **f,
-                "url": f"{base}/jobs/{row['id']}/artifact/{f['name']}"
-                f"?token={row['artifact_token']}",
-            }
+            {**f, "path": f"/jobs/{row['id']}/artifact/{f['name']}?token={row['artifact_token']}"}
             for f in files
         ],
     }
 
 
 @app.get("/jobs")
-def list_jobs(request: Request):
+def list_jobs():
     # ponytail: the client polls this. SSE (GET /jobs/stream) is v0.2, and it
     # needs progress values that only exist once the worker reports them back.
     with db.reading() as conn:
@@ -398,7 +397,7 @@ def list_jobs(request: Request):
             "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
             (db.DEV_USER_ID,),
         ).fetchall()
-    return {"jobs": [_job_json(r, request) for r in rows]}
+    return {"jobs": [_job_json(r) for r in rows]}
 
 
 @app.get("/jobs/{job_id}/artifact/{filename}")
