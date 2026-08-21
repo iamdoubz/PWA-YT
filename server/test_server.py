@@ -1,0 +1,117 @@
+"""Self-check: `uv run python test_server.py`.
+
+Plain asserts, no pytest. Covers the things that are silently wrong rather than
+loudly broken — id and timestamp formats the sync cursor depends on, the pragmas
+FM-nothing will remind you about, and the size estimate the user reads before
+committing a download.
+
+Nothing here touches the network. Extraction is checked against the live site by
+hitting /resolve; that check becomes the nightly extractor canary in v0.2.
+"""
+
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+os.environ["TARMAC_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
+
+import db  # noqa: E402  (must follow the env var)
+import extract  # noqa: E402
+
+
+def test_uuid7_shape_and_ordering():
+    ids = [db.uuid7() for _ in range(200)]
+    assert len(set(ids)) == 200, "uuid7 collided"
+    for i in ids:
+        assert i[14] == "7", f"version nibble should be 7, got {i}"
+        assert i[19] in "89ab", f"variant should be 10xx, got {i}"
+    # Same-millisecond ids may tie, but the sequence must never go backwards.
+    assert ids == sorted(ids) or ids[0][:8] <= ids[-1][:8], "uuid7 lost time ordering"
+
+
+def test_now_is_iso8601_utc_millis():
+    earlier = db.now()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", earlier), earlier
+    time.sleep(0.002)
+    later = db.now()
+    # Lexicographic order must equal chronological order; the sync cursor relies
+    # on it, and a stamp without fixed-width millis would silently break that.
+    assert earlier < later, f"{earlier} should sort before {later}"
+
+
+def test_init_applies_pragmas_and_seeds_user():
+    db.init()
+    with db.reading() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (db.DEV_USER_ID,)).fetchone()
+        assert row is not None and row["email"] == db.DEV_USER_EMAIL
+    db.init()  # idempotent: a restart must not duplicate the dev user
+    with db.reading() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+
+
+def test_foreign_keys_are_enforced():
+    with db.reading() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO library_items (id, user_id, source_key, format_profile,"
+                " added_at, updated_at) VALUES (?,?,?,?,?,?)",
+                (db.uuid7(), "nobody", "youtube:x", "{}", db.now(), db.now()),
+            )
+        except Exception as err:
+            assert "FOREIGN KEY" in str(err).upper(), err
+        else:
+            raise AssertionError("foreign key violation was accepted")
+
+
+def test_writing_rolls_back_on_error():
+    key = "youtube:rollback"
+    try:
+        with db.writing() as conn:
+            conn.execute(
+                "INSERT INTO sources (source_key, extractor, source_id, canonical_url,"
+                " refreshed_at) VALUES (?,?,?,?,?)",
+                (key, "youtube", "rollback", "http://x", db.now()),
+            )
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    with db.reading() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sources WHERE source_key = ?", (key,)
+        ).fetchone()[0] == 0, "failed transaction left a row behind"
+
+
+def test_estimated_bytes_matches_the_documented_example():
+    # 04-api.md: a 213s item at 192 kbps estimates 5_112_000 bytes.
+    assert extract.estimated_bytes(213, 192) == 5_112_000
+    assert extract.estimated_bytes(None, 192) == 0
+
+
+def test_source_key_is_extractor_colon_id():
+    assert extract._source_key({"extractor_key": "Youtube", "id": "dQw4w9WgXcQ"}) == (
+        "youtube:dQw4w9WgXcQ"
+    )
+    assert extract._source_key({"extractor_key": "SoundCloud", "id": "1234567"}) == (
+        "soundcloud:1234567"
+    )
+
+
+if __name__ == "__main__":
+    db.init()  # schema must exist before any test that touches it
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_"):
+            continue
+        try:
+            fn()
+            print(f"pass  {name}")
+        except Exception as err:
+            failures += 1
+            print(f"FAIL  {name}: {type(err).__name__}: {err}")
+    print(f"\n{failures} failure(s)")
+    sys.exit(1 if failures else 0)

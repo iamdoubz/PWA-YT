@@ -1,0 +1,10 @@
+[project]
+name = "tarmac-server"
+version = "0.1.0"
+description = "Stateless transformer. Holds metadata, never media."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "yt-dlp>=2026.8.19",
+]
