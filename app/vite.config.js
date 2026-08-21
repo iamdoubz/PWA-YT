@@ -22,6 +22,10 @@ const net = {
 };
 
 export default defineConfig({
+  // Stamped into the readiness panel. A service worker keeps serving the
+  // previous shell until a second load, so "which build am I actually running"
+  // is a real question on a phone you cannot attach a debugger to.
+  define: { __BUILD__: JSON.stringify(new Date().toISOString().slice(0, 19) + 'Z') },
   plugins: [
     svelte(),
     VitePWA({

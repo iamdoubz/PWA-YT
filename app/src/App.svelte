@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import * as db from './db.js';
+  import * as db from './db.svelte.js';
   import * as api from './api.js';
   import { API } from './api.js';
   import { net } from './net.svelte.js';
@@ -28,6 +28,11 @@
   let persisted = $state(null);
   let moveSupported = $state(null);
   let mediaActions = $state({});
+  let sweep = $state(null); // { checked, total } while the verification sweep runs
+  let storage = $state(null); // { usage, quota }
+  let lastSync = $state(null);
+  let lastVerify = $state(null);
+  let shellCached = $state(false);
   let playingId = $state(null);
   let paused = $state(true);
   let at = $state(0);
@@ -41,7 +46,9 @@
   const inFlight = new Set();
 
   const playing = $derived(items.find((i) => i.id === playingId) ?? null);
-  const downloaded = $derived(items.filter((i) => media[i.id]));
+  // "downloaded" means the bytes are here, not that a row once claimed they were.
+  const downloaded = $derived(items.filter((i) => media[i.id]?.state === 'present'));
+  const verified = $derived(downloaded.filter((i) => media[i.id]?.verified_at).length);
 
   onMount(async () => {
     // The boot path. Local reads only — no fetch, no await on anything that
@@ -53,6 +60,10 @@
     booted = true;
 
     navigator.storage.persisted().then((v) => (persisted = v));
+    shellCached = !!navigator.serviceWorker?.controller;
+    db.getMeta('last_sync').then((v) => (lastSync = v));
+    db.getMeta('last_verify').then((v) => (lastVerify = v));
+    refreshStorage();
 
     // Object URLs are built for every downloaded item up front, not on click.
     // Reading OPFS is async, and awaiting it inside a click handler breaks the
@@ -69,9 +80,21 @@
 
     setupMediaSession();
 
-    // Optional, failable, and strictly after first paint.
-    queueMicrotask(() => startPolling());
+    // Both optional, both failable, both strictly after first paint. FM-6 says
+    // verify lazily — first paint uses the catalogue's claimed state and the
+    // sweep corrects it a moment later, rather than blocking boot on N stat
+    // calls that would each have to succeed before anything appeared.
+    queueMicrotask(() => {
+      startPolling();
+      runSweep();
+    });
   });
+
+  async function refreshStorage() {
+    if (!navigator.storage?.estimate) return;
+    const { usage, quota } = await navigator.storage.estimate();
+    storage = { usage, quota };
+  }
 
   // ------------------------------------------------------------------ adding
 
@@ -136,6 +159,9 @@
       return;
     }
 
+    lastSync = new Date().toISOString();
+    db.setMeta('last_sync', lastSync);
+
     let busy = false;
     for (const job of data.jobs) {
       jobs[job.item_id] = job;
@@ -153,9 +179,56 @@
     progress[job.item_id] = 0;
     errors[job.item_id] = null;
     worker.postMessage({
+      type: 'download',
       itemId: job.item_id,
-      files: job.files.map((f) => ({ name: f.name, url: API + f.path })),
+      // The hash the server computed with Python's hashlib. The worker checks
+      // the bytes against it on the way to disk — FM-4 wants both length and
+      // checksum, and length alone only catches truncation.
+      files: job.files.map((f) => ({ name: f.name, url: API + f.path, sha256: f.sha256 })),
     });
+  }
+
+  // FM-6 recovery, and the highest-value button in the app: it tells someone
+  // about to board a plane what is actually on their device, while there is
+  // still network to fix it.
+  function runSweep() {
+    if (sweep) return;
+    const rows = Object.values(media).filter((r) => r.state === 'present');
+    if (!rows.length) return;
+    sweep = { checked: 0, total: rows.length };
+    try {
+      worker.postMessage({
+        type: 'verify',
+        // $state.snapshot: these rows are reactive proxies, and structuredClone
+        // cannot clone a Proxy — postMessage throws DataCloneError without this.
+        rows: $state.snapshot(rows).map((r) => ({ item_id: r.item_id, files: r.files })),
+      });
+    } catch (err) {
+      // Never leave the button stuck on "Checking…" with nothing running.
+      sweep = null;
+      errors.sweep = String(err);
+    }
+  }
+
+  async function applySweep(missing) {
+    const stamp = new Date().toISOString();
+    for (const row of Object.values(media).filter((r) => r.state === 'present')) {
+      const gone = missing.includes(row.item_id);
+      const next = { ...row, state: gone ? 'missing' : 'present', verified_at: stamp };
+      await db.put('local_media', next);
+      media[row.item_id] = next;
+      if (gone) {
+        // Stays in the library, marked "not downloaded", one tap from being
+        // restored. Local loss is an inconvenience, never data loss.
+        for (const url of Object.values(urls[row.item_id] ?? {})) URL.revokeObjectURL(url);
+        delete urls[row.item_id];
+        if (playingId === row.item_id) stop();
+      }
+    }
+    lastVerify = stamp;
+    await db.setMeta('last_verify', stamp);
+    sweep = null;
+    refreshStorage();
   }
 
   const roleOf = (name) =>
@@ -166,6 +239,15 @@
       progress[data.itemId] = data.done / data.total;
       return;
     }
+    if (data.type === 'verify_progress') {
+      sweep = { checked: data.checked, total: data.total };
+      return;
+    }
+    if (data.type === 'verified') {
+      await applySweep(data.missing);
+      return;
+    }
+    if (data.type === 'purged') return;
 
     inFlight.delete(data.itemId);
     progress[data.itemId] = undefined;
@@ -179,14 +261,22 @@
 
     // FM-4: the row claiming the file exists is the LAST thing written, after
     // every byte is on disk and verified.
+    const stamp = new Date().toISOString();
     const row = {
       item_id: data.itemId,
       state: 'present',
-      files: data.files.map((f) => ({ role: roleOf(f.name), name: f.name, bytes: f.bytes })),
-      downloaded_at: new Date().toISOString(),
+      files: data.files.map((f) => ({
+        role: roleOf(f.name),
+        name: f.name,
+        bytes: f.bytes,
+        sha256: f.sha256,
+      })),
+      downloaded_at: stamp,
+      verified_at: stamp, // it was hashed on the way in
     };
     await db.put('local_media', row);
     media[data.itemId] = row;
+    refreshStorage();
 
     // The collection acknowledgement. Best-effort: if it fails the TTL reaper
     // cleans up server-side, which is a backstop rather than the happy path.
@@ -200,21 +290,31 @@
   }
 
   async function resolveUrls(row) {
+    // Per file, not all-or-nothing. An item whose audio was evicted but whose
+    // artwork survived still shows its artwork — FM-6 wants it to stay visible
+    // and recognisable in the library, not become a grey box.
+    //
+    // A file that is not there is an expected state, not an error: WebKit
+    // evicts under storage pressure and that is precisely what the sweep and
+    // the 'missing' badge exist to report. Surfacing a raw NotFoundError here
+    // would put DOM exception text in front of someone who just needs to see
+    // "not downloaded" and a button.
+    const next = {};
     try {
       const root = await navigator.storage.getDirectory();
       const dir = await (await root.getDirectoryHandle('media')).getDirectoryHandle(row.item_id);
-      const next = {};
       for (const f of row.files) {
-        const file = await (await dir.getFileHandle(f.name)).getFile();
-        next[f.role] = URL.createObjectURL(file);
+        try {
+          next[f.role] = URL.createObjectURL(await (await dir.getFileHandle(f.name)).getFile());
+        } catch {
+          /* that one file is gone; the sweep is what records it */
+        }
       }
-      for (const url of Object.values(urls[row.item_id] ?? {})) URL.revokeObjectURL(url);
-      urls[row.item_id] = next;
-    } catch (err) {
-      // FM-6: the row claims the file exists and it does not. v0.2 downgrades
-      // the item to state 'missing' with a one-tap re-download.
-      errors[row.item_id] = `not on disk: ${err}`;
+    } catch {
+      /* the whole directory is gone; same */
     }
+    for (const url of Object.values(urls[row.item_id] ?? {})) URL.revokeObjectURL(url);
+    urls[row.item_id] = next;
   }
 
   async function redownload(item) {
@@ -232,15 +332,12 @@
     delete urls[item.id];
     if (playingId === item.id) stop();
 
-    if (media[item.id]) {
-      const root = await navigator.storage.getDirectory();
-      const dir = await root.getDirectoryHandle('media');
-      await dir.removeEntry(item.id, { recursive: true }).catch(() => {});
-    }
+    if (media[item.id]) worker.postMessage({ type: 'purge', itemId: item.id });
     await db.remove('local_media', item.id);
     await db.remove('items', item.id);
     delete media[item.id];
     items = items.filter((i) => i.id !== item.id);
+    refreshStorage();
     // Offline-tolerant by accident, not by design. The outbox is v0.3.
     api.deleteItem(item.id).catch(() => {});
   }
@@ -341,6 +438,15 @@
       ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
       : '–:––';
   const mb = (b) => `${(b / 1e6).toFixed(1)} MB`;
+  const gb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : mb(b ?? 0));
+  const when = (iso) => {
+    const mins = Math.round((Date.now() - Date.parse(iso)) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.round(mins / 60);
+    return hrs < 24 ? `${hrs} h ago` : `${Math.round(hrs / 24)} d ago`;
+  };
+  const BUILD = __BUILD__;
 </script>
 
 <!-- The one long-lived audio element. Never recreated. -->
@@ -365,7 +471,7 @@
 ></audio>
 
 <main>
-  <h1>Tarmac <span class="ver">v0.1</span></h1>
+  <h1>Tarmac <span class="ver">v0.2</span></h1>
 
   <form
     class="add"
@@ -419,13 +525,16 @@
           </div>
           <div class="meta">
             <strong>{item.title}</strong>
-            <span class="dim">{item.uploader} · {clock(item.duration_s)}</span>
+            <span class="dim">
+              {item.uploader} · {clock(item.duration_s)}
+              {#if media[item.id]?.state === 'missing'} · not downloaded{/if}
+            </span>
             {#if errors[item.id]}<span class="err">{errors[item.id]}</span>{/if}
           </div>
           <div class="actions">
             {#if pct !== undefined}
               <span class="dim">{Math.round(pct * 100)}%</span>
-            {:else if media[item.id]}
+            {:else if media[item.id]?.state === 'present'}
               <button onclick={() => play(item)}>Play</button>
               <button class="ghost" onclick={() => forget(item)}>Delete</button>
             {:else if job && ACTIVE.includes(job.state)}
@@ -472,8 +581,21 @@
     <section class="readiness">
       <h2>Offline readiness</h2>
       <dl>
+        <dt>App shell</dt>
+        <dd class:bad={!shellCached}>
+          {shellCached ? 'cached' : 'NOT CACHED — reload once'} · built {BUILD}
+        </dd>
         <dt>Library</dt>
-        <dd>{items.length} items, {downloaded.length} downloaded</dd>
+        <dd>
+          {items.length} items · {downloaded.length} downloaded · {verified} verified
+          {#if items.length - downloaded.length > 0}
+            <span class="bad">· {items.length - downloaded.length} missing</span>
+          {/if}
+        </dd>
+        <dt>Storage used</dt>
+        <dd>
+          {storage ? `${gb(storage.usage)} of ${gb(storage.quota)} available` : '…'}
+        </dd>
         <dt>Persistent storage</dt>
         <dd class:bad={persisted === false}>
           {persisted === null ? '…' : persisted ? 'granted' : 'DENIED'}
@@ -493,9 +615,22 @@
             .map(([a]) => a)
             .join(', ') || 'all registered'}
         </dd>
+        <dt>Last sync</dt>
+        <dd>{lastSync ? when(lastSync) : 'never'}</dd>
+        <dt>Last checked</dt>
+        <dd>{lastVerify ? when(lastVerify) : 'never'}</dd>
         <dt>Network calls</dt>
         <dd>{net.ok} ok / {net.fail} failed</dd>
       </dl>
+
+      <button class="ghost wide" onclick={runSweep} disabled={!!sweep || !downloaded.length}>
+        {sweep ? `Checking… ${sweep.checked}/${sweep.total}` : 'Check my library'}
+      </button>
+
+      <p class="dim">
+        "Check my library" re-reads every downloaded file. Run it before you fly,
+        while there is still network to re-download anything that has gone.
+      </p>
       <p class="dim">
         Assertion 12: after a cold boot in airplane mode, with no downloads
         started, "ok" must read 0. Counts main-thread fetch only.
@@ -638,6 +773,10 @@
   button.ghost {
     background: #232327;
     color: #c8c8d0;
+  }
+  button.wide {
+    width: 100%;
+    margin: 0.5rem 0;
   }
   .player {
     position: fixed;

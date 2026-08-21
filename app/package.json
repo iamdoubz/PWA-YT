@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "fixtures": "node scripts/make-fixtures.js",
-    "check:no-cdn": "node scripts/check-no-cdn.js"
+    "check:no-cdn": "node scripts/check-no-cdn.js",
+    "test:sha": "node scripts/sha256.test.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",

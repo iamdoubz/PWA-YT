@@ -244,7 +244,7 @@ in full.
 
 ## D-012 · Byte-length verification only in v0.0; no SHA-256
 
-**Status:** accepted · 2026-08-21 · temporary, closes in v0.1
+**Status:** CLOSED in v0.2 · see the resolution note at the end of this entry
 
 **Decision.** The download worker verifies `Content-Length` against
 `accessHandle.getSize()` and nothing else.
@@ -258,6 +258,13 @@ against; the only available answer would be self-reported. v0.1 emits
 
 **What would change it.** Nothing — this is a stub with a known closing date, not
 a position.
+
+**Resolution (v0.2).** Closed. `app/src/sha256.js` implements an incremental
+SHA-256 and the worker hashes each chunk on its way to disk, so nothing is ever
+buffered. The digest is compared against the server's `X-Artifact-SHA256` before
+the `.part` rename, and a mismatch deletes the partial file. Pinned by NIST
+vectors plus randomised agreement with node's `crypto`; cross-checked in
+production against Python's `hashlib` on every download.
 
 ---
 
@@ -339,3 +346,33 @@ each to `.part` before renaming.
 
 **Unchanged.** The `DELETE /jobs/{id}/artifact` acknowledgement is still one call
 for the whole set, and still the contract that keeps the server stateless.
+
+---
+
+## D-016 · Snapshot `$state` at the structured-clone boundary, not at call sites
+
+**Status:** accepted · 2026-08-21 · cost two bugs to learn
+
+**Decision.** `db.svelte.js` calls `$state.snapshot()` inside `put()`. Any other
+place that hands reactive state to `postMessage` snapshots explicitly.
+
+**Context.** Svelte 5 `$state` values are Proxies, and **structured clone cannot
+clone a Proxy**. Both boundaries in this app go through structured clone:
+
+- `worker.postMessage(...)` → `DataCloneError`
+- `IDBObjectStore.put(...)` → `DataCloneError`
+
+The verification sweep hit both in succession. Worse, the failure is quiet in
+the shapes that matter: a spread like `{ ...row }` produces a plain outer object
+whose *nested* arrays are still proxies, so the bug survives the obvious fix and
+reappears one layer down. The visible symptom was a button stuck reading
+"Checking… 1/1" forever, with the real cause only in the console.
+
+**Rationale for the boundary.** Fixing it per call site means every future
+`db.put` is one careless spread away from the same bug. One snapshot inside
+`put` makes it structurally impossible, at the cost of forcing that module to be
+`.svelte.js` so it can use the rune.
+
+**Also.** `runSweep` wraps its `postMessage` in try/catch and clears the sweep
+state on throw. A synchronous failure that leaves the UI claiming work is in
+progress is worse than the failure itself.

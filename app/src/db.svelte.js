@@ -7,12 +7,13 @@
 // Revisit when playlists and the outbox arrive and there is a real migration.
 
 const NAME = 'tarmac';
-const VERSION = 2;
+const VERSION = 3;
 
 // store name -> keyPath
 const STORES = {
   items: 'id',
   local_media: 'item_id',
+  meta: 'key', // last sync, last verification sweep
 };
 
 function open() {
@@ -46,5 +47,19 @@ async function run(store, mode, fn) {
 }
 
 export const all = (store) => run(store, 'readonly', (s) => s.getAll());
-export const put = (store, row) => run(store, 'readwrite', (s) => s.put(row));
+
+/**
+ * Rows arriving here are usually Svelte `$state` proxies, and neither
+ * IndexedDB nor postMessage can structured-clone a Proxy — both throw
+ * DataCloneError. Snapshotting at this boundary, once, means no call site can
+ * get it wrong. It is also why this file is `.svelte.js`: `$state.snapshot` is
+ * a rune and is not available in a plain module.
+ */
+export const put = (store, row) =>
+  run(store, 'readwrite', (s) => s.put($state.snapshot(row)));
+
 export const remove = (store, key) => run(store, 'readwrite', (s) => s.delete(key));
+
+export const getMeta = async (key) =>
+  (await run('meta', 'readonly', (s) => s.get(key)))?.value ?? null;
+export const setMeta = (key, value) => put('meta', { key, value });
