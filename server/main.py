@@ -10,6 +10,8 @@ import random
 import secrets
 import shutil
 import threading
+import time
+from concurrent import futures
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,7 +20,7 @@ from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import db
@@ -29,6 +31,21 @@ RESOLVE_TIMEOUT_S = 60
 JOB_TIMEOUT_S = 30 * 60
 ARTIFACT_TTL_S = 60 * 60
 RUNNERS = 2
+SSE_MAX_S = 5 * 60
+CANARY_EVERY_S = 6 * 60 * 60
+
+# One known-good URL per extractor. When one of these starts failing, the
+# extractor has broken upstream — which is a when, not an if. This is the early
+# warning, and it is why /health/extractors exists.
+CANARY_URLS = {
+    "youtube": os.environ.get(
+        "TARMAC_CANARY_YOUTUBE", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    ),
+}
+if os.environ.get("TARMAC_CANARY_SOUNDCLOUD"):
+    CANARY_URLS["soundcloud"] = os.environ["TARMAC_CANARY_SOUNDCLOUD"]
+
+_canary: dict[str, dict] = {}
 
 # Deliberately not S3. In deployment this is a size-capped tmpfs mount, so a
 # crashed process cannot leave media on a real disk.
@@ -102,6 +119,11 @@ def _claim() -> dict | None:
 
 
 def _finish(job_id: str, result: dict, scratch_dir: Path) -> None:
+    # By name prefix, not an exact "audio.m4a": an MP3 profile emits audio.mp3,
+    # and the exact-match version raised StopIteration on the first one.
+    audio = next(
+        (f for f in result["files"] if f["name"].startswith("audio")), result["files"][0]
+    )
     token = secrets.token_urlsafe(32)
     expires = (datetime.now(timezone.utc) + timedelta(seconds=ARTIFACT_TTL_S)).isoformat(
         timespec="milliseconds"
@@ -117,7 +139,7 @@ def _finish(job_id: str, result: dict, scratch_dir: Path) -> None:
                 "copied" if result["copied"] else "transcoded",
                 str(scratch_dir),
                 sum(f["bytes"] for f in result["files"]),
-                next(f["sha256"] for f in result["files"] if f["name"] == "audio.m4a"),
+                audio["sha256"],
                 json.dumps(result["files"]),
                 token,
                 expires,
@@ -180,14 +202,72 @@ def _runner() -> None:
                     (job["item_id"],),
                 ).fetchone()
             profile = json.loads(row["format_profile"])
-            result = _job_pool.submit(
+            future = _job_pool.submit(
                 pipeline.run, row["canonical_url"], profile, str(scratch_dir)
-            ).result(timeout=JOB_TIMEOUT_S)
-            _finish(job["id"], result, scratch_dir)
+            )
+            _pump_progress(job["id"], future, scratch_dir)
+            _finish(job["id"], future.result(timeout=0), scratch_dir)
         except FutureTimeout:
+            future.cancel()
             _fail(job["id"], f"Gave up after {JOB_TIMEOUT_S // 60} minutes.", scratch_dir)
         except Exception as err:
             _fail(job["id"], f"{type(err).__name__}: {err}", scratch_dir)
+
+
+def _pump_progress(job_id: str, future, scratch_dir: Path) -> None:
+    """Wait for the job, republishing whatever the worker last wrote.
+
+    At most one DB write per second per job: fine-grained values belong on the
+    SSE stream, not in a row that would otherwise be rewritten hundreds of times
+    for a single download.
+    """
+    deadline = time.monotonic() + JOB_TIMEOUT_S
+    last = None
+    while True:
+        done, _ = futures.wait([future], timeout=1)
+        if done:
+            return
+        if time.monotonic() > deadline:
+            raise FutureTimeout()
+        try:
+            report = json.loads((scratch_dir / "progress.json").read_text())
+        except (OSError, ValueError):
+            continue
+        current = (report["stage"], round(report["fraction"], 2))
+        if current == last:
+            continue
+        last = current
+        with db.writing() as conn:
+            conn.execute(
+                "UPDATE jobs SET state=?, progress=?, stage_detail=?, updated_at=? WHERE id=?",
+                (report["stage"], report["fraction"], report["stage"], db.now(), job_id),
+            )
+
+
+def _run_canary() -> None:
+    for name, url in CANARY_URLS.items():
+        started = time.monotonic()
+        try:
+            entry = _resolve_pool.submit(extract.resolve, url, 192).result(timeout=90)
+            _canary[name] = {
+                "ok": True,
+                "title": entry["title"],
+                "checked_at": db.now(),
+                "took_ms": int((time.monotonic() - started) * 1000),
+            }
+        except Exception as err:
+            _canary[name] = {
+                "ok": False,
+                "error": f"{type(err).__name__}: {err}"[:300],
+                "checked_at": db.now(),
+                "took_ms": int((time.monotonic() - started) * 1000),
+            }
+
+
+def _canary_loop() -> None:
+    while not _stop.is_set():
+        _run_canary()
+        _stop.wait(CANARY_EVERY_S)
 
 
 def _sweep_orphan_scratch() -> None:
@@ -212,6 +292,7 @@ async def lifespan(_: FastAPI):
     _resolve_pool = ProcessPoolExecutor(max_workers=2)
     _job_pool = ProcessPoolExecutor(max_workers=RUNNERS)
     threads = [threading.Thread(target=_runner, daemon=True) for _ in range(RUNNERS)]
+    threads.append(threading.Thread(target=_canary_loop, daemon=True))
     for t in threads:
         t.start()
     try:
@@ -237,6 +318,16 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "version": app.version}
+
+
+@app.get("/health/extractors")
+def health_extractors():
+    """Result of the periodic canary — your early warning for extractor
+    breakage, which is the single most likely thing to take this app down."""
+    if not _canary:
+        return {"extractors": {}, "note": "no canary run has completed yet"}
+    status = 200 if all(r["ok"] for r in _canary.values()) else 503
+    return JSONResponse({"extractors": _canary}, status_code=status)
 
 
 @app.post("/resolve")
@@ -318,7 +409,13 @@ def create_items(req: ItemsRequest):
                        (id, user_id, source_key, format_profile, added_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(user_id, source_key) DO UPDATE
-                       SET deleted_at = NULL, updated_at = excluded.updated_at
+                       SET deleted_at = NULL,
+                           updated_at = excluded.updated_at,
+                           -- The profile is per item precisely so that re-pulling
+                           -- the same track at a different bitrate or codec is a
+                           -- button, not a migration. Without this the second
+                           -- request silently reuses the first one's format.
+                           format_profile = excluded.format_profile
                    RETURNING id, (added_at != updated_at) AS existed""",
                 (db.uuid7(), db.DEV_USER_ID, entry.source_key, profile, db.now(), db.now()),
             ).fetchone()
@@ -375,6 +472,7 @@ def _job_json(row) -> dict:
         "id": row["id"],
         "item_id": row["item_id"],
         "state": row["state"],
+        "progress": row["progress"],
         "stage_detail": row["stage_detail"],
         "error": row["error"],
         # Paths are relative: the server owns the shape, the client owns the
@@ -398,6 +496,39 @@ def list_jobs():
             (db.DEV_USER_ID,),
         ).fetchall()
     return {"jobs": [_job_json(r) for r in rows]}
+
+
+@app.get("/jobs/stream")
+def stream_jobs():
+    """One SSE connection for all in-flight jobs.
+
+    Not WebSockets: progress is one-directional, SSE reconnects on its own, and
+    it survives mobile network transitions better than a socket you have to
+    babysit. Connections are capped so a client that wanders off does not hold
+    a threadpool worker forever — EventSource reconnects by itself.
+    """
+
+    def events():
+        last = None
+        deadline = time.monotonic() + SSE_MAX_S
+        while time.monotonic() < deadline:
+            with db.reading() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
+                    (db.DEV_USER_ID,),
+                ).fetchall()
+            payload = json.dumps({"jobs": [_job_json(r) for r in rows]})
+            if payload != last:
+                last = payload
+                yield f"data: {payload}\n\n"
+            time.sleep(1)
+        yield "event: reconnect\ndata: {}\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/jobs/{job_id}/artifact/{filename}")

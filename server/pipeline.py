@@ -13,7 +13,9 @@ The output set has fixed names so the client never has to parse or guess:
 """
 
 import hashlib
+import json
 import subprocess
+import time
 from pathlib import Path
 
 import yt_dlp
@@ -21,6 +23,29 @@ import yt_dlp
 from extract import AUDIO_FORMAT
 
 CHUNK = 1024 * 1024
+
+# The fetch is the long pole — it moves bytes over someone else's network. The
+# ffmpeg step is usually a stream copy (D-014) and takes seconds, so it gets a
+# single coarse step rather than parsed -progress output.
+#
+# ponytail: if long transcodes ever feel like a hang, add `-progress pipe:1` to
+# the audio encode and parse out_time_us. Not before.
+FETCH_SHARE = 0.85
+
+
+def _report(scratch: Path, stage: str, fraction: float) -> None:
+    """Progress goes out as a file in the job's own scratch directory.
+
+    The runner reads it. No multiprocessing.Manager, no queue proxy, no extra
+    process to supervise — and it survives a worker that dies mid-job, because
+    the last thing it wrote is still on disk.
+    """
+    try:
+        (scratch / "progress.json").write_text(
+            json.dumps({"stage": stage, "fraction": round(min(fraction, 1.0), 4)})
+        )
+    except OSError:
+        pass  # progress is never worth failing a download over
 
 
 class TransformError(Exception):
@@ -114,11 +139,27 @@ def run(url: str, profile: dict, scratch_dir: str) -> dict:
     """Fetch and transform. Returns the manifest the client will pull."""
     if profile.get("keep_video"):
         raise TransformError("video arrives in v1.0; keep_video must be false")
-    if profile.get("audio_codec") != "aac":
-        raise TransformError("v0.1 encodes AAC only; MP3 arrives in v0.2")
+    codec = profile.get("audio_codec", "aac")
+    if codec not in ("aac", "mp3"):
+        raise TransformError(f"unsupported audio_codec {codec!r}")
 
     scratch = Path(scratch_dir)
     scratch.mkdir(parents=True, exist_ok=True)
+    _report(scratch, "fetching", 0.0)
+
+    last = [0.0]
+
+    def on_progress(d):
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        if not total:
+            return
+        # Debounced: do not write a file for every progress callback.
+        if time.monotonic() - last[0] < 0.5:
+            return
+        last[0] = time.monotonic()
+        _report(scratch, "fetching", d.get("downloaded_bytes", 0) / total * FETCH_SHARE)
 
     opts = {
         "quiet": True,
@@ -127,6 +168,7 @@ def run(url: str, profile: dict, scratch_dir: str) -> dict:
         "noplaylist": True,
         "outtmpl": str(scratch / "%(id)s.%(ext)s"),
         "writethumbnail": profile.get("save_artwork", True),
+        "progress_hooks": [on_progress],
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -135,33 +177,49 @@ def run(url: str, profile: dict, scratch_dir: str) -> dict:
         raise TransformError(str(err)) from err
 
     source = Path(info["requested_downloads"][0]["filepath"])
-    raw = scratch / "audio.raw.m4a"
+    _report(scratch, "transforming", FETCH_SHARE)
 
-    if should_copy(profile, info.get("acodec"), info.get("abr")):
+    ext = "m4a" if codec == "aac" else "mp3"
+    raw = scratch / f"audio.raw.{ext}"
+    copied = should_copy(profile, info.get("acodec"), info.get("abr"))
+
+    if copied:
         _ffmpeg("-i", str(source), "-vn", "-c:a", "copy",
                 *_tags(info), "-movflags", "+faststart", str(raw))
-    else:
+    elif codec == "aac":
         _ffmpeg("-i", str(source), "-vn", "-c:a", "aac",
                 "-b:a", f"{profile['audio_bitrate']}k",
                 *_tags(info), "-movflags", "+faststart", str(raw))
+    else:
+        # -q:a 2 is VBR at roughly 190 kbps and a better default than CBR.
+        _ffmpeg("-i", str(source), "-vn", "-c:a", "libmp3lame", "-q:a", "2",
+                "-id3v2_version", "3", *_tags(info), str(raw))
 
     has_art = profile.get("save_artwork", True) and _artwork(scratch, info, source)
 
-    audio = scratch / "audio.m4a"
+    audio = scratch / f"audio.{ext}"
     if has_art:
         # Embed so the file is self-describing outside the app too.
-        _ffmpeg("-i", str(raw), "-i", str(scratch / "art.jpg"), "-map", "0", "-map", "1",
-                "-c", "copy", "-disposition:v:0", "attached_pic", str(audio))
+        art = str(scratch / "art.jpg")
+        if codec == "aac":
+            _ffmpeg("-i", str(raw), "-i", art, "-map", "0", "-map", "1",
+                    "-c", "copy", "-disposition:v:0", "attached_pic", str(audio))
+        else:
+            _ffmpeg("-i", str(raw), "-i", art, "-map", "0:a", "-map", "1:v",
+                    "-c", "copy", "-id3v2_version", "3",
+                    "-metadata:s:v", "title=Album cover",
+                    "-disposition:v", "attached_pic", str(audio))
         raw.unlink(missing_ok=True)
     else:
         raw.rename(audio)
 
     # Scratch is size-capped and the source is dead weight once transformed.
     source.unlink(missing_ok=True)
+    (scratch / "progress.json").unlink(missing_ok=True)
 
-    names = ["audio.m4a"] + (["art.jpg", "art-sq.jpg"] if has_art else [])
+    names = [audio.name] + (["art.jpg", "art-sq.jpg"] if has_art else [])
     return {
-        "copied": should_copy(profile, info.get("acodec"), info.get("abr")),
+        "copied": copied,
         "files": [
             {"name": n, "bytes": (scratch / n).stat().st_size, "sha256": _sha256(scratch / n)}
             for n in names

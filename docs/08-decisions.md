@@ -376,3 +376,26 @@ reappears one layer down. The visible symptom was a button stuck reading
 **Also.** `runSweep` wraps its `postMessage` in try/catch and clears the sweep
 state on throw. A synchronous failure that leaves the UI claiming work is in
 progress is worse than the failure itself.
+
+---
+
+## D-017 · Job progress travels as a file in scratch, not through an IPC queue
+
+**Status:** accepted · 2026-08-21
+
+**Decision.** `pipeline.run` writes `{stage, fraction}` to `progress.json`
+inside the job's own scratch directory, debounced to twice a second. The runner
+thread polls that file while it waits on the future and republishes to SQLite at
+most once per second per job. SSE reads from SQLite.
+
+**Rationale.** The alternative is a `multiprocessing.Manager().Queue()` proxy
+passed into the pool worker, which means another process to supervise and a
+proxy object to keep alive across a spawn boundary. A file needs neither, is
+already inside the directory that gets deleted when the job ends, and survives a
+worker that dies mid-job — the last thing it wrote is still there to read.
+
+**Scope.** yt-dlp progress covers 0 → 0.85; the ffmpeg step is one coarse jump
+to 0.9. The fetch is the long pole because it moves bytes over someone else's
+network, and after D-014 the transform is usually a stream copy that takes
+seconds. If a long transcode ever reads as a hang, add `-progress pipe:1` to the
+audio encode and parse `out_time_us`. Not before.

@@ -25,6 +25,10 @@
   let planError = $state(null);
   let resolving = $state(false);
 
+  // Sent with every add. Stored per item server-side, so re-adding the same
+  // track at a different bitrate genuinely re-pulls it at that bitrate.
+  let profile = $state({ audio_codec: 'aac', audio_bitrate: 192, save_artwork: true });
+
   let persisted = $state(null);
   let moveSupported = $state(null);
   let mediaActions = $state({});
@@ -104,7 +108,7 @@
     planError = null;
     plan = null;
     try {
-      plan = (await api.resolveUrl(urlInput.trim())).entry;
+      plan = (await api.resolveUrl(urlInput.trim(), $state.snapshot(profile))).entry;
     } catch (err) {
       planError = err.message;
     } finally {
@@ -116,7 +120,7 @@
     const entry = plan;
     plan = null;
     try {
-      const created = (await api.createItem(entry.source_key)).items[0];
+      const created = (await api.createItem(entry.source_key, $state.snapshot(profile))).items[0];
       const row = {
         id: created.item_id,
         source_key: entry.source_key,
@@ -138,40 +142,45 @@
 
   function startPolling() {
     if (poll) return;
-    // ponytail: polling, not SSE. GET /jobs/stream is v0.2 and needs progress
-    // values the worker does not report back yet. Two seconds is fine for a
-    // queue you can count on one hand.
-    poll = setInterval(pollJobs, 2000);
-    pollJobs();
+    poll = api.openJobStream(applyJobs, () => {
+      // Offline, or no server. Neither is an error — the library is local.
+      stopPolling();
+    });
   }
 
   function stopPolling() {
-    clearInterval(poll);
+    poll?.close();
     poll = null;
   }
 
-  async function pollJobs() {
-    let data;
-    try {
-      data = await api.listJobs();
-    } catch {
-      stopPolling(); // offline, or no server. Neither is an error here.
-      return;
-    }
-
+  function applyJobs(data) {
     lastSync = new Date().toISOString();
     db.setMeta('last_sync', lastSync);
 
     let busy = false;
     for (const job of data.jobs) {
       jobs[job.item_id] = job;
-      if (job.state === 'failed') errors[job.item_id] = job.error;
+      errors[job.item_id] = job.state === 'failed' ? job.error : null;
       if (job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
         pull(job);
       }
       if (ACTIVE.includes(job.state)) busy = true;
     }
+    // Idle means nothing to watch; holding the stream open would pin a server
+    // thread for no reason. Any new action reopens it.
     if (!busy && inFlight.size === 0) stopPolling();
+  }
+
+  async function retry(item) {
+    const job = jobs[item.id];
+    if (!job) return;
+    errors[item.id] = null;
+    try {
+      await api.retryJob(job.id);
+      startPolling();
+    } catch (err) {
+      errors[item.id] = err.message;
+    }
   }
 
   function pull(job) {
@@ -320,7 +329,7 @@
   async function redownload(item) {
     errors[item.id] = null;
     try {
-      await api.createItem(item.source_key);
+      await api.createItem(item.source_key, $state.snapshot(profile));
       startPolling();
     } catch (err) {
       errors[item.id] = err.message;
@@ -491,6 +500,39 @@
     </button>
   </form>
 
+  <details class="format">
+    <summary class="dim">
+      Format: {profile.audio_codec.toUpperCase()} {profile.audio_bitrate} kbps{profile.save_artwork
+        ? ' · artwork'
+        : ''}
+    </summary>
+    <div class="row">
+      <label>
+        Codec
+        <select bind:value={profile.audio_codec}>
+          <option value="aac">AAC</option>
+          <option value="mp3">MP3</option>
+        </select>
+      </label>
+      <label>
+        Bitrate
+        <select bind:value={profile.audio_bitrate}>
+          <option value={128}>128</option>
+          <option value={192}>192</option>
+          <option value={256}>256</option>
+        </select>
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={profile.save_artwork} /> Artwork
+      </label>
+    </div>
+    <p class="dim">
+      Stored per item. Re-adding a track at a different setting re-pulls it at
+      that setting. A bitrate above what the source offers is ignored — raising
+      it cannot add back what the original encoder discarded.
+    </p>
+  </details>
+
   {#if planError}
     <p class="err">{planError}</p>
   {/if}
@@ -533,12 +575,17 @@
           </div>
           <div class="actions">
             {#if pct !== undefined}
-              <span class="dim">{Math.round(pct * 100)}%</span>
+              <span class="dim">{Math.round(pct * 100)}% to device</span>
             {:else if media[item.id]?.state === 'present'}
               <button onclick={() => play(item)}>Play</button>
               <button class="ghost" onclick={() => forget(item)}>Delete</button>
             {:else if job && ACTIVE.includes(job.state)}
-              <span class="dim">{STAGE[job.state]}…</span>
+              <span class="dim">
+                {STAGE[job.state]}{job.progress ? ` ${Math.round(job.progress * 100)}%` : ''}…
+              </span>
+            {:else if job?.state === 'failed'}
+              <button onclick={() => retry(item)}>Retry</button>
+              <button class="ghost" onclick={() => forget(item)}>Delete</button>
             {:else}
               <button onclick={() => redownload(item)}>Download</button>
               <button class="ghost" onclick={() => forget(item)}>Delete</button>
@@ -777,6 +824,38 @@
   button.wide {
     width: 100%;
     margin: 0.5rem 0;
+  }
+  .format {
+    margin-bottom: 1rem;
+  }
+  .format summary {
+    cursor: pointer;
+    min-height: 32px;
+  }
+  .format .row {
+    gap: 1rem;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    margin: 0.5rem 0;
+  }
+  .format label {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    color: #8b8b94;
+  }
+  .format select {
+    font: inherit;
+    min-height: 36px;
+    background: #16161a;
+    color: #e8e8ea;
+    border: 1px solid #33333a;
+    border-radius: 6px;
+    padding: 0 0.4rem;
+  }
+  .format .check input {
+    width: 20px;
+    height: 20px;
   }
   .player {
     position: fixed;

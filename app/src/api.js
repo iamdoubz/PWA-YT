@@ -30,13 +30,59 @@ async function request(path, options = {}) {
   return body;
 }
 
-export const resolveUrl = (url) =>
-  request('/resolve', { method: 'POST', body: JSON.stringify({ url }) });
+export const resolveUrl = (url, format_profile) =>
+  request('/resolve', { method: 'POST', body: JSON.stringify({ url, format_profile }) });
 
-export const createItem = (source_key) =>
-  request('/items', { method: 'POST', body: JSON.stringify({ entries: [{ source_key }] }) });
+export const createItem = (source_key, format_profile) =>
+  request('/items', {
+    method: 'POST',
+    body: JSON.stringify({ entries: [{ source_key, format_profile }] }),
+  });
 
 export const listJobs = () => request('/jobs');
+
+export const retryJob = (id) => request(`/jobs/${id}/retry`, { method: 'POST' });
+
+/**
+ * One SSE connection for all in-flight jobs.
+ *
+ * EventSource reconnects on its own, which is usually the point — but offline
+ * that means a network request every few seconds forever, and FM-2 is explicit
+ * that a library sitting in storage must not depend on the network. So a real
+ * failure closes the stream and tells the caller; only the server's own
+ * connection cap (which arrives as a `reconnect` event) is reconnected through.
+ */
+export function openJobStream(onJobs, onLost) {
+  let source = null;
+  let expected = false;
+  let closed = false;
+
+  const connect = () => {
+    source = new EventSource(`${API}/jobs/stream`);
+    source.onmessage = (e) => onJobs(JSON.parse(e.data));
+    source.addEventListener('reconnect', () => {
+      expected = true;
+    });
+    source.onerror = () => {
+      source.close();
+      if (closed) return;
+      if (expected) {
+        expected = false;
+        connect();
+        return;
+      }
+      onLost?.();
+    };
+  };
+
+  connect();
+  return {
+    close() {
+      closed = true;
+      source?.close();
+    },
+  };
+}
 
 export const deleteItem = (id) => request(`/items/${id}`, { method: 'DELETE' });
 

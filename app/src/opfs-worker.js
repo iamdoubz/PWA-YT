@@ -94,6 +94,15 @@ async function download(itemId, files) {
       ),
     );
   }
+
+  // Re-downloading at a different profile writes audio.mp3 next to the old
+  // audio.m4a, and nothing references the old one again — it just sits there
+  // consuming the storage the user is trying to budget. Anything not in the
+  // manifest we just wrote is stale, including abandoned .part files.
+  const keep = new Set(written.map((f) => f.name));
+  for await (const name of dir.keys()) {
+    if (!keep.has(name)) await dir.removeEntry(name).catch(() => {});
+  }
   return written;
 }
 
