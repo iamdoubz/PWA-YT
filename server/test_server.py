@@ -101,6 +101,25 @@ def test_source_key_is_extractor_colon_id():
     )
 
 
+def test_prefer_copy_never_upscales_a_bitrate():
+    import pipeline
+
+    aac = {"prefer_copy": True, "audio_codec": "aac", "audio_bitrate": 192}
+    # YouTube itag 140 is ~129 kbps AAC and the default target is 192. Copy it:
+    # raising the bitrate cannot recover information the encoder already threw
+    # away, and it makes the file bigger. This is the D-014 case.
+    assert pipeline.should_copy(aac, "mp4a.40.2", 129.5) is True
+    # Asked for something smaller than the source: that is a real transcode.
+    assert pipeline.should_copy({**aac, "audio_bitrate": 128}, "mp4a.40.2", 129.5) is False
+    # Equal is still a copy.
+    assert pipeline.should_copy({**aac, "audio_bitrate": 128}, "mp4a.40.2", 128) is True
+    # Opus source must always be transcoded; it is not AAC.
+    assert pipeline.should_copy(aac, "opus", 128.9) is False
+    # Explicitly disabled, or a different target codec.
+    assert pipeline.should_copy({**aac, "prefer_copy": False}, "mp4a.40.2", 129.5) is False
+    assert pipeline.should_copy({**aac, "audio_codec": "mp3"}, "mp4a.40.2", 129.5) is False
+
+
 if __name__ == "__main__":
     db.init()  # schema must exist before any test that touches it
     failures = 0

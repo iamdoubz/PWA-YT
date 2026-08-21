@@ -279,3 +279,63 @@ file that owns OPFS.
 main-thread fetch counter used for assertion 12 does not see downloads. That is
 the desired reading: offline, the count must be zero, and a download is the one
 thing that legitimately touches the network.
+
+---
+
+## D-014 · prefer_copy compares the other way round
+
+**Status:** accepted · 2026-08-21 · corrects `05-formats.md`
+
+**Decision.** Stream-copy when the source is already AAC and the requested
+bitrate is **not lower** than the source's. Transcode only when the user asked
+for something smaller.
+
+**Context.** The original rule was "copy if the source is AAC at or above the
+target bitrate". Resolving a reference item shows what YouTube actually offers:
+
+```
+   140  mp4a.40.2      129.5 kbps  m4a   <- best AAC available
+   251  opus           128.9 kbps  webm
+   139  mp4a.40.5       48.8 kbps  m4a
+```
+
+With `audio_bitrate` defaulting to 192, `129.5 >= 192` is false, so the copy
+path would never have fired for YouTube at all. Every track would take a lossy
+AAC → AAC transcode producing a **larger** file containing **worse** audio, and
+spending server CPU to do it. Raising a bitrate cannot recover information the
+first encoder discarded.
+
+**Rationale for the direction.** The only case where re-encoding AAC is what the
+user meant is when they want a *smaller* file — which `05-formats.md` already
+cites as the motivating example for storing profiles per item ("re-pull one long
+podcast at 128 kbps mono"). Everything else is loss for nothing.
+
+**Verified.** The pipeline reports `copied` for the default profile, and the
+output probes as `aac, 127999 bps` — the source stream intact, not a 192k
+re-encode. `test_prefer_copy_never_upscales_a_bitrate` pins the rule.
+
+---
+
+## D-015 · The artifact is a set of files, not one blob
+
+**Status:** accepted · 2026-08-21 · refines `04-api.md`
+
+**Decision.** `GET /jobs/{id}/artifact/{filename}` serves one file at a time.
+The file list lives in the job row as `artifact_manifest`, carrying per-file
+name, byte length and SHA-256, and `GET /jobs` hands the client ready-made URLs.
+
+**Context.** `04-api.md` describes a single `GET /jobs/{id}/artifact` returning
+one stream with `X-Artifact-SHA256` and `Content-Length`. But `05-formats.md`
+specifies that the pipeline always produces a **set** — `audio.m4a`, `art.jpg`,
+`art-sq.jpg`, plus `video.mp4` when `keep_video` — with fixed names that the
+client mirrors into OPFS unchanged. One URL cannot carry four files without
+inventing a bundle format and a client-side unpacker.
+
+**Rationale.** Per-file URLs mean per-file `Range` resume and per-file length
+and hash verification, which is what FM-4 actually wants; a bundle would have to
+be fully received before any of it could be checked. It also needs no new client
+code — the v0.0 download worker already takes a list of `{name, url}` and writes
+each to `.part` before renaming.
+
+**Unchanged.** The `DELETE /jobs/{id}/artifact` acknowledgement is still one call
+for the whole set, and still the contract that keeps the server stateless.

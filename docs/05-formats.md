@@ -36,10 +36,19 @@ With `prefer_copy` and an already-acceptable source:
 ffmpeg -i in.m4a -vn -c:a copy -movflags +faststart out.m4a
 ```
 
-Check before transcoding: if the source audio stream is already AAC at or above
-the target bitrate, **stream-copy it**. YouTube's itag 140 is 128 kbps AAC and
-SoundCloud frequently serves AAC over HLS. Transcoding AAC → AAC costs quality
-for nothing and burns server time.
+Check before transcoding: if the source audio stream is already AAC, and the
+target bitrate is **not lower** than the source's, **stream-copy it**. YouTube's
+itag 140 is ~129 kbps AAC and SoundCloud frequently serves AAC over HLS.
+Transcoding AAC → AAC costs quality for nothing and burns server time.
+
+The comparison direction matters and the obvious version of it is wrong. "Copy
+if the source is at or above the target" sounds right, but with a 192 default
+and a 129 kbps source it never fires: every YouTube track would take a lossy
+AAC → AAC transcode producing a *larger* file containing *worse* audio. Raising
+a bitrate cannot recover information the first encoder discarded. Transcode only
+when the user asked for something **smaller** than the source — the "re-pull this
+podcast at 128 mono" case that per-item profiles exist for. See `08-decisions.md`
+D-014.
 
 `+faststart` moves the moov atom to the front. It costs one extra pass and it is
 what lets playback start immediately from a local file.

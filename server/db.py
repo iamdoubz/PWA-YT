@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   artifact_path       TEXT,
   artifact_bytes      INTEGER,
   artifact_sha256     TEXT,
+  -- The pipeline emits a SET of files with fixed names (05-formats.md), so the
+  -- manifest carries per-file name/bytes/sha256. See D-015.
+  artifact_manifest   TEXT,
   artifact_token      TEXT,
   artifact_expires_at TEXT,
   created_at          TEXT NOT NULL,
@@ -158,7 +161,12 @@ def init() -> None:
         raise RuntimeError(
             f"SQLite {sqlite3.sqlite_version} is too old; RETURNING needs >= 3.35"
         )
-    _writer = _configure(sqlite3.connect(DB_PATH, check_same_thread=False))
+    # isolation_level="IMMEDIATE" makes `with conn:` open BEGIN IMMEDIATE rather
+    # than a deferred transaction, which is what makes the job claim in main.py
+    # race-free without SKIP LOCKED.
+    _writer = _configure(
+        sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level="IMMEDIATE")
+    )
     with _write_lock:
         _writer.executescript(SCHEMA)
         _writer.execute(

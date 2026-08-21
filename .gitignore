@@ -12,3 +12,4 @@ server/tarmac.db-wal
 server/tarmac.db-shm
 server/.venv/
 __pycache__/
+server/scratch/
