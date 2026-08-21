@@ -176,19 +176,40 @@
     });
   }
 
+  // Reported by the readiness panel: a handler Safari refuses is a lock-screen
+  // button that silently does nothing, and you only find out at 35,000 feet.
+  let mediaActions = $state({});
+
   function setupMediaSession() {
     if (!('mediaSession' in navigator)) return;
-    const ms = navigator.mediaSession;
-    ms.setActionHandler('play', () => audio.play());
-    ms.setActionHandler('pause', () => audio.pause());
-    ms.setActionHandler('previoustrack', () => step(-1));
-    ms.setActionHandler('nexttrack', () => step(1));
-    // Without seekto the lock-screen scrubber is decorative.
-    ms.setActionHandler('seekto', (d) => {
-      if (d.fastSeek && audio.fastSeek) audio.fastSeek(d.seekTime);
-      else audio.currentTime = d.seekTime;
-      pushPositionState();
-    });
+    const handlers = {
+      play: () => audio.play(),
+      pause: () => audio.pause(),
+      previoustrack: () => step(-1),
+      nexttrack: () => step(1),
+      // Without seekto the lock-screen scrubber is decorative.
+      seekto: (d) => {
+        if (d.fastSeek && audio.fastSeek) audio.fastSeek(d.seekTime);
+        else audio.currentTime = d.seekTime;
+        pushPositionState();
+      },
+    };
+    for (const [action, fn] of Object.entries(handlers)) {
+      // Safari throws NotSupportedError for actions it does not implement.
+      // Registering in a loop means one refusal cannot skip the rest.
+      try {
+        navigator.mediaSession.setActionHandler(action, fn);
+        mediaActions[action] = true;
+      } catch {
+        mediaActions[action] = false;
+      }
+    }
+  }
+
+  // Left at the default 'none', the lock screen has to guess whether it is
+  // playing, and iOS guesses by showing the wrong transport button.
+  function setPlaybackState(state) {
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = state;
   }
 
   function pushPositionState() {
@@ -227,8 +248,14 @@
   bind:this={audio}
   preload="auto"
   playsinline
-  onplay={() => (paused = false)}
-  onpause={() => (paused = true)}
+  onplay={() => {
+    paused = false;
+    setPlaybackState('playing');
+  }}
+  onpause={() => {
+    paused = true;
+    setPlaybackState('paused');
+  }}
   ontimeupdate={onTimeUpdate}
   onloadedmetadata={() => {
     duration = audio.duration;
@@ -312,6 +339,13 @@
             : moveSupported
               ? 'supported'
               : 'UNSUPPORTED — files kept as .part'}
+        </dd>
+        <dt>Lock-screen controls</dt>
+        <dd class:bad={Object.values(mediaActions).some((v) => !v)}>
+          {Object.entries(mediaActions)
+            .filter(([, ok]) => !ok)
+            .map(([a]) => a)
+            .join(', ') || 'all registered'}
         </dd>
         <dt>Network calls</dt>
         <dd class:bad={net.ok > 0}>{net.ok} ok / {net.fail} failed</dd>
