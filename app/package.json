@@ -1,0 +1,21 @@
+{
+  "name": "tarmac-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "fixtures": "node scripts/make-fixtures.js",
+    "check:no-cdn": "node scripts/check-no-cdn.js"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "vite": "^8.2.2",
+    "vite-plugin-pwa": "^1.3.0"
+  },
+  "dependencies": {
+    "svelte": "^5.56.10"
+  }
+}

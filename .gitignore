@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dev-dist/
+
+# Generated test fixtures — regenerate with `npm run fixtures`.
+# 86 MB of sine wave does not belong in git.
+app/public/media/
