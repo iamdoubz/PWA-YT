@@ -82,10 +82,36 @@ class ResolveRequest(BaseModel):
 class ItemEntry(BaseModel):
     source_key: str = Field(min_length=3)
     format_profile: FormatProfile = FormatProfile()
+    # Opaque fractional-index string, set only when this entry is also being
+    # attached to a playlist. The server never generates or compares these.
+    position: str | None = None
 
 
 class ItemsRequest(BaseModel):
     entries: list[ItemEntry] = Field(min_length=1)
+    playlist_id: str | None = None
+
+
+class PlaylistCreate(BaseModel):
+    id: str = Field(min_length=1)  # client-generated UUIDv7 — makes create idempotent
+    name: str = Field(min_length=1)
+
+
+class PlaylistRename(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class PlaylistItemUpsert(BaseModel):
+    item_id: str
+    position: str
+
+
+class PlaylistItemsPatch(BaseModel):
+    """Either a full ordered replacement (many upserts) or a single-move patch
+    (one upsert) — same shape either way, see 04-api.md."""
+
+    upserts: list[PlaylistItemUpsert] = []
+    removes: list[str] = []
 
 
 def error(status: int, code: str, message: str, **extra) -> JSONResponse:
@@ -252,7 +278,7 @@ def _run_canary() -> None:
     for name, url in CANARY_URLS.items():
         started = time.monotonic()
         try:
-            entry = _resolve_pool.submit(extract.resolve, url, 192).result(timeout=90)
+            _, entry = _resolve_pool.submit(extract.probe, url, 192).result(timeout=90)
             _canary[name] = {
                 "ok": True,
                 "title": entry["title"],
@@ -334,28 +360,7 @@ def health_extractors():
     return JSONResponse({"extractors": _canary}, status_code=status)
 
 
-@app.post("/resolve")
-def resolve(req: ResolveRequest):
-    """Stage 2. Returns a plan, not a job. Nothing is downloaded or enqueued.
-
-    Resolving before enqueueing is the difference between a usable import and an
-    act of faith — the user sees title, duration and estimated size before
-    committing anything to their phone.
-    """
-    try:
-        entry = _resolve_pool.submit(
-            extract.resolve, req.url, req.format_profile.audio_bitrate
-        ).result(timeout=RESOLVE_TIMEOUT_S)
-    except FutureTimeout:
-        return error(
-            504,
-            "resolve_timeout",
-            f"That URL took more than {RESOLVE_TIMEOUT_S}s to look up. "
-            "The site may be slow or blocking us; try again in a minute.",
-        )
-    except extract.ResolveError as err:
-        return error(422, "resolve_failed", str(err))
-
+def _upsert_source(entry: dict) -> None:
     with db.writing() as conn:
         conn.execute(
             """INSERT INTO sources (source_key, extractor, source_id, canonical_url,
@@ -369,25 +374,70 @@ def resolve(req: ResolveRequest):
             {**entry, "refreshed_at": db.now()},
         )
 
+
+def _already_in_library(source_key: str) -> bool:
     with db.reading() as conn:
-        existing = conn.execute(
+        row = conn.execute(
             "SELECT 1 FROM library_items"
             " WHERE user_id = ? AND source_key = ? AND deleted_at IS NULL",
-            (db.DEV_USER_ID, entry["source_key"]),
+            (db.DEV_USER_ID, source_key),
         ).fetchone()
+    return row is not None
 
+
+def _resolved_entry(entry: dict) -> dict:
     return {
-        "kind": "item",
-        "entry": {
-            "source_key": entry["source_key"],
-            "title": entry["title"],
-            "uploader": entry["uploader"],
-            "duration_s": entry["duration_s"],
-            "thumb_url": entry["thumb_url"],
-            "estimated_bytes": entry["estimated_bytes"],
-            "already_in_library": existing is not None,
-        },
+        "source_key": entry["source_key"],
+        "title": entry["title"],
+        "uploader": entry["uploader"],
+        "duration_s": entry["duration_s"],
+        "thumb_url": entry["thumb_url"],
+        "estimated_bytes": entry["estimated_bytes"],
+        "already_in_library": _already_in_library(entry["source_key"]),
     }
+
+
+@app.post("/resolve")
+def resolve(req: ResolveRequest):
+    """Stage 2. Returns a plan, not a job. Nothing is downloaded or enqueued.
+
+    Resolving before enqueueing is the difference between a usable import and an
+    act of faith — the user sees title, duration and estimated size before
+    committing anything to their phone. A single item comes back as one JSON
+    object; a playlist streams as NDJSON so entries appear as they're enumerated
+    rather than all at once after a 400-entry wait.
+    """
+    try:
+        kind, payload = _resolve_pool.submit(
+            extract.probe, req.url, req.format_profile.audio_bitrate
+        ).result(timeout=RESOLVE_TIMEOUT_S)
+    except FutureTimeout:
+        return error(
+            504,
+            "resolve_timeout",
+            f"That URL took more than {RESOLVE_TIMEOUT_S}s to look up. "
+            "The site may be slow or blocking us; try again in a minute.",
+        )
+    except extract.ResolveError as err:
+        return error(422, "resolve_failed", str(err))
+
+    if kind == "item":
+        _upsert_source(payload)
+        return {"kind": "item", "entry": _resolved_entry(payload)}
+
+    def events():
+        entries = payload["entries"]
+        yield json.dumps(
+            {"kind": "playlist_head", "title": payload["title"], "entry_count": len(entries)}
+        ) + "\n"
+        total = 0
+        for i, entry in enumerate(entries):
+            _upsert_source(entry)
+            total += entry["estimated_bytes"] or 0
+            yield json.dumps({"kind": "entry", "index": i, **_resolved_entry(entry)}) + "\n"
+        yield json.dumps({"kind": "playlist_done", "total_estimated_bytes": total}) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.post("/items")
@@ -431,6 +481,15 @@ def create_items(req: ItemsRequest):
                 (db.uuid7(), db.DEV_USER_ID, item_id, db.now(), db.now()),
             ).fetchone()
 
+            if req.playlist_id and entry.position:
+                conn.execute(
+                    """INSERT INTO playlist_items (playlist_id, item_id, position, updated_at, deleted_at)
+                       VALUES (?, ?, ?, ?, NULL)
+                       ON CONFLICT(playlist_id, item_id) DO UPDATE SET
+                         position=excluded.position, updated_at=excluded.updated_at, deleted_at=NULL""",
+                    (req.playlist_id, item_id, entry.position, db.now()),
+                )
+
         created.append(
             {
                 "item_id": item_id,
@@ -467,6 +526,94 @@ def delete_item(item_id: str):
             "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
             (db.now(), db.now(), item_id, db.DEV_USER_ID),
         )
+    return {"ok": True}
+
+
+# --------------------------------------------------------------- playlists
+#
+# Every mutation below is safe to replay: create takes a client-generated id
+# (INSERT ... DO NOTHING), rename/delete are idempotent by nature (last write
+# always wins), and the items upsert is ON CONFLICT DO UPDATE. That is what
+# lets the client's offline outbox just retry the same call rather than
+# needing a separate idempotency-key ledger. See 08-decisions.md D-018.
+
+
+@app.post("/playlists")
+def create_playlist(req: PlaylistCreate):
+    with db.writing() as conn:
+        conn.execute(
+            """INSERT INTO playlists (id, user_id, name, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO NOTHING""",
+            (req.id, db.DEV_USER_ID, req.name, db.now(), db.now()),
+        )
+    return {"ok": True, "id": req.id}
+
+
+@app.get("/playlists")
+def list_playlists():
+    with db.reading() as conn:
+        playlists = conn.execute(
+            "SELECT * FROM playlists WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at",
+            (db.DEV_USER_ID,),
+        ).fetchall()
+        pl_items = conn.execute(
+            """SELECT playlist_id, item_id, position FROM playlist_items
+                WHERE deleted_at IS NULL ORDER BY playlist_id, position"""
+        ).fetchall()
+    by_playlist: dict[str, list] = {}
+    for row in pl_items:
+        by_playlist.setdefault(row["playlist_id"], []).append(
+            {"item_id": row["item_id"], "position": row["position"]}
+        )
+    return {
+        "playlists": [
+            {**dict(p), "items": by_playlist.get(p["id"], [])} for p in playlists
+        ]
+    }
+
+
+@app.patch("/playlists/{playlist_id}")
+def rename_playlist(playlist_id: str, req: PlaylistRename):
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE playlists SET name=?, updated_at=? WHERE id=? AND user_id=?",
+            (req.name, db.now(), playlist_id, db.DEV_USER_ID),
+        )
+    return {"ok": True}
+
+
+@app.delete("/playlists/{playlist_id}")
+def delete_playlist(playlist_id: str):
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE playlists SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
+            (db.now(), db.now(), playlist_id, db.DEV_USER_ID),
+        )
+    return {"ok": True}
+
+
+@app.put("/playlists/{playlist_id}/items")
+def patch_playlist_items(playlist_id: str, req: PlaylistItemsPatch):
+    """Full ordered replacement (many upserts) or a single-move patch (one
+    upsert) — same endpoint, see 04-api.md. A reorder writes exactly the rows
+    that moved, never the whole list, which is what keeps a 200-track offline
+    reorder to one outbox row per move rather than a renumbered tail."""
+    with db.writing() as conn:
+        for u in req.upserts:
+            conn.execute(
+                """INSERT INTO playlist_items (playlist_id, item_id, position, updated_at, deleted_at)
+                   VALUES (?, ?, ?, ?, NULL)
+                   ON CONFLICT(playlist_id, item_id) DO UPDATE SET
+                     position=excluded.position, updated_at=excluded.updated_at, deleted_at=NULL""",
+                (playlist_id, u.item_id, u.position, db.now()),
+            )
+        for item_id in req.removes:
+            conn.execute(
+                """UPDATE playlist_items SET deleted_at=?, updated_at=?
+                    WHERE playlist_id=? AND item_id=?""",
+                (db.now(), db.now(), playlist_id, item_id),
+            )
     return {"ok": True}
 
 

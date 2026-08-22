@@ -91,11 +91,34 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
   bytes   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS playlists (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_playlists_sync ON playlists(user_id, updated_at);
+
+-- position is an opaque fractional-index string. The server never generates or
+-- interprets it — that logic lives once, client-side, in the same module that
+-- already owns the npm package for it. See 08-decisions.md D-018.
+CREATE TABLE IF NOT EXISTS playlist_items (
+  playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  item_id     TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+  position    TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  deleted_at  TEXT,
+  PRIMARY KEY (playlist_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS ix_pli_order ON playlist_items(playlist_id, position);
 """
 
-# playlists / playlist_items / credentials / sessions are in 03-data-model.md but
-# land with the phases that use them (v0.3, v0.4). Creating tables nothing reads
-# is how a schema starts lying about what the app does.
+# credentials / sessions are in 03-data-model.md but land with v0.4 (accounts).
+# Creating tables nothing reads is how a schema starts lying about what the app
+# does.
 
 _writer: sqlite3.Connection | None = None
 _write_lock = threading.Lock()

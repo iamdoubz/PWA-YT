@@ -89,7 +89,9 @@ def test_writing_rolls_back_on_error():
 def test_estimated_bytes_matches_the_documented_example():
     # 04-api.md: a 213s item at 192 kbps estimates 5_112_000 bytes.
     assert extract.estimated_bytes(213, 192) == 5_112_000
-    assert extract.estimated_bytes(None, 192) == 0
+    # v0.3: None, not 0 — a flat playlist entry with no reported duration is
+    # "unknown size", which the import UI must not silently count as zero.
+    assert extract.estimated_bytes(None, 192) is None
 
 
 def test_source_key_is_extractor_colon_id():

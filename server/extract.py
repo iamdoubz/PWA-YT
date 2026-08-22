@@ -21,30 +21,58 @@ def _source_key(info: dict) -> str:
     return f"{extractor}:{info['id']}"
 
 
-def estimated_bytes(duration_s: int | None, bitrate_kbps: int) -> int:
+def estimated_bytes(duration_s: int | None, bitrate_kbps: int) -> int | None:
     """duration x target bitrate / 8. An estimate, and the UI must label it one —
     but the running total is what stops someone committing 2 GB to a phone with
-    900 MB free."""
-    return int((duration_s or 0) * bitrate_kbps * 1000 / 8)
+    900 MB free. None when the source did not report a duration at all (flat
+    playlist entries sometimes don't); the UI shows those as size-unknown rather
+    than silently counting them as zero."""
+    if duration_s is None:
+        return None
+    return int(duration_s * bitrate_kbps * 1000 / 8)
 
 
-def resolve(url: str, bitrate_kbps: int) -> dict:
-    """extract_info(download=False). Returns a plan, never a job.
+def _thumb(entry: dict) -> str | None:
+    if entry.get("thumbnail"):
+        return entry["thumbnail"]
+    thumbs = entry.get("thumbnails") or []
+    return thumbs[-1]["url"] if thumbs else None
 
-    Stage 2 of the pipeline. Nothing is fetched, nothing is enqueued, nothing is
-    written to disk.
+
+def _flat_entry(entry: dict, bitrate_kbps: int, fallback_extractor: str) -> dict:
+    extractor = (entry.get("ie_key") or fallback_extractor or "").lower()
+    # SoundCloud reports fractional seconds; round for the same reason the
+    # single-item path does — the column is INTEGER and SQLite's type affinity
+    # would otherwise quietly store a REAL in it.
+    duration = entry.get("duration")
+    duration = round(duration) if duration is not None else None
+    return {
+        "source_key": f"{extractor}:{entry['id']}",
+        "extractor": extractor,
+        "source_id": entry["id"],
+        "canonical_url": entry.get("url") or entry.get("webpage_url"),
+        "title": entry.get("title"),
+        "uploader": entry.get("uploader") or entry.get("channel"),
+        "duration_s": duration,
+        "thumb_url": _thumb(entry),
+        "estimated_bytes": estimated_bytes(duration, bitrate_kbps),
+    }
+
+
+def probe(url: str, bitrate_kbps: int) -> tuple[str, dict]:
+    """extract_info(download=False), flat. Returns a plan, never a job.
+
+    One call handles both shapes: a plain video/track URL comes back fully
+    resolved (extract_flat only affects enumeration of a playlist's *entries*,
+    not a solo item), and a playlist URL comes back as flat entries — which is
+    what makes resolving a 400-entry playlist take about as long as one lookup,
+    since nothing per-entry is fetched.
     """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "format": AUDIO_FORMAT,
-        "noplaylist": True,  # single items only until v0.3
-        # Without this, a /playlist?list= URL resolves every entry in full and
-        # blows the request timeout, so the user gets "the site may be slow"
-        # when the truth is "this is a playlist". Flat enumeration is cheap and
-        # lets the guard below fire with an honest message. It is also the mode
-        # v0.3 needs for streaming a 400-entry plan.
         "extract_flat": "in_playlist",
     }
     try:
@@ -54,18 +82,16 @@ def resolve(url: str, bitrate_kbps: int) -> dict:
         raise ResolveError(str(err)) from err
 
     if info.get("_type") == "playlist":
-        count = info.get("playlist_count") or len(info.get("entries") or [])
-        raise ResolveError(
-            f"That is a playlist ({count} items). Playlist import arrives in v0.3 — "
-            "paste a single track URL for now."
-        )
+        fallback_extractor = (info.get("extractor_key") or "").lower()
+        entries = [e for e in (info.get("entries") or []) if e]
+        return "playlist", {
+            "title": info.get("title") or "Playlist",
+            "entries": [_flat_entry(e, bitrate_kbps, fallback_extractor) for e in entries],
+        }
 
-    # SoundCloud reports fractional seconds (62.617). The column is INTEGER and
-    # SQLite's type affinity would quietly store a REAL in it, so round here
-    # rather than letting two extractors disagree about the column's type.
     duration = info.get("duration")
     duration = round(duration) if duration is not None else None
-    return {
+    return "item", {
         "source_key": _source_key(info),
         "extractor": (info.get("extractor_key") or "").lower(),
         "source_id": info["id"],

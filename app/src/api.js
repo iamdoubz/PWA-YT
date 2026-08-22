@@ -39,6 +39,65 @@ export const createItem = (source_key, format_profile) =>
     body: JSON.stringify({ entries: [{ source_key, format_profile }] }),
   });
 
+export const createItems = (entries, playlist_id) =>
+  request('/items', { method: 'POST', body: JSON.stringify({ entries, playlist_id }) });
+
+/**
+ * `/resolve` is one JSON object for a single item, or NDJSON for a playlist —
+ * one line per entry as yt-dlp's flat enumeration produces it, so a 400-entry
+ * playlist can start rendering before the last entry arrives rather than after
+ * a single multi-second wait. Read as a stream either way; a single item is
+ * just a one-line stream.
+ *
+ * Resolving a large playlist is slower than the 20s default, so this bypasses
+ * `request()` and sets its own timeout.
+ */
+export async function streamResolve(url, format_profile, { onLine, signal } = {}) {
+  const res = await fetch(`${API}/resolve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ url, format_profile }),
+    signal: signal ?? AbortSignal.timeout(120_000),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ApiError(body, res.status);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (line) onLine(JSON.parse(line));
+    }
+  }
+  if (buf.trim()) onLine(JSON.parse(buf));
+}
+
+// ------------------------------------------------------------------ playlists
+
+export const createPlaylist = (id, name) =>
+  request('/playlists', { method: 'POST', body: JSON.stringify({ id, name }) });
+
+export const listPlaylists = () => request('/playlists');
+
+export const renamePlaylist = (id, name) =>
+  request(`/playlists/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+
+export const deletePlaylist = (id) => request(`/playlists/${id}`, { method: 'DELETE' });
+
+export const patchPlaylistItems = (playlistId, upserts = [], removes = []) =>
+  request(`/playlists/${playlistId}/items`, {
+    method: 'PUT',
+    body: JSON.stringify({ upserts, removes }),
+  });
+
 export const listJobs = () => request('/jobs');
 
 export const retryJob = (id) => request(`/jobs/${id}/retry`, { method: 'POST' });

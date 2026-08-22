@@ -399,3 +399,53 @@ to 0.9. The fetch is the long pole because it moves bytes over someone else's
 network, and after D-014 the transform is usually a stream copy that takes
 seconds. If a long transcode ever reads as a hang, add `-progress pipe:1` to the
 audio encode and parse `out_time_us`. Not before.
+
+---
+
+## D-018 · Playlist ordering lives client-side only; the outbox has no idempotency ledger
+
+**Status:** accepted · 2026-08-22 · v0.3
+
+**Context.** `03-data-model.md` §6 specifies fractional indexing for
+`playlist_items.position` and `04-api.md` describes `/sync/outbox` replaying
+mutations that "each carry an idempotency key." Both needed a concrete design
+for v0.3.
+
+**Decision, part 1 — position is opaque to the server.** The fractional-index
+algorithm (base62 midpoint strings, insert-between semantics) is real enough to
+get subtly wrong, so it is implemented exactly once, client-side, via the
+`fractional-indexing` npm package — not ported to Python too. `playlist_items`
+on the server stores whatever string the client sends and never generates or
+interprets one itself. This is also why `POST /items` takes a `position` per
+entry rather than the server assigning sequential keys during playlist import:
+a second implementation of the same algorithm is exactly the kind of subtle
+duplication that drifts.
+
+**Decision, part 2 — no idempotency-key ledger.** The outbox (client:
+`app/src/outbox.js`) replays queued mutations by re-issuing the *same* REST
+call, not a dedicated batch endpoint. This is safe only because every mutation
+kind it's used for is already idempotent by construction:
+
+- Creates (`playlist_create`) carry a client-generated UUIDv7 id and the server
+  does `INSERT ... ON CONFLICT(id) DO NOTHING`.
+- Renames and deletes are last-write-wins by nature — replaying one twice is a
+  no-op the second time.
+- The playlist-items patch (`playlist_items_patch`) is `ON CONFLICT DO UPDATE`,
+  so re-upserting the same `(item_id, position)` twice is harmless.
+
+**What this doesn't cover.** Genuine multi-device conflict resolution — two
+devices reordering the same playlist offline and reconciling via `updated_at`
+— is still v0.4's `/sync` pull, not this. The outbox only replays this
+device's own queued mutations in order; it does not pull anyone else's.
+
+**Known gap.** Deleting a library item does not cascade into the playlists
+that contain it — `playlist_items` rows referencing a deleted item are left in
+place (the UI hides them via a join against the live `items` mirror, so
+nothing broken is visible, but the rows accumulate server-side). Revisit if a
+library sees enough delete/re-add churn for this to matter; `03-data-model.md`
+doesn't specify cascade behavior here either.
+
+**What would change this.** The idempotency-ledger approach becomes necessary
+the moment a mutation kind is *not* naturally idempotent — at that point add
+one for that kind specifically, rather than retrofitting a ledger everything
+has to carry.

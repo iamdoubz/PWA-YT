@@ -1,8 +1,11 @@
 # Build status
 
-**As of:** 2026-08-22 · commit `3156c5f`
+**As of:** 2026-08-22 · commit `3156c5f` + uncommitted v0.3 work (playlists, outbox)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
-**Phases claimed complete:** v0.0 (added), v0.1, v0.2
+**Phases claimed complete:** v0.0 (added), v0.1, v0.2. v0.3 is built and smoke-tested
+in a desktop browser (server killed/restarted to simulate reconnect) but **not**
+run through the real offline test protocol on a device — same risk position as
+v0.1/v0.2, see §1.
 **Verified on:** desktop Chrome only
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
@@ -43,9 +46,12 @@ app/                          the PWA — owns all durable media
   index.html
   vite.config.js              PWA config, /api proxy, no-media precache
   src/main.js                 mount; installs the fetch counter first
-  src/App.svelte              library, add flow, player, readiness panel
-  src/api.js                  every network call; SSE stream helper
-  src/db.svelte.js            IndexedDB v3: items, local_media, meta
+  src/App.svelte              library, playlists, add flow, player, readiness panel
+  src/api.js                  every network call; SSE + NDJSON stream helpers
+  src/db.svelte.js            IndexedDB v4: items, local_media, playlists,
+                               playlist_items, outbox, meta
+  src/outbox.js                offline mutation queue; replays on reconnect
+  src/id.js                    client uuid7() for offline-created playlists
   src/opfs-worker.js          the ONLY thing that touches OPFS
   src/sha256.js               incremental digest (Web Crypto has none)
   src/net.svelte.js           fetch counter for assertion 12
@@ -54,9 +60,9 @@ app/                          the PWA — owns all durable media
   scripts/make-fixtures.js    generates the PWA icons
 
 server/                       stateless transformer — never a media library
-  main.py                     endpoints, job runner, SSE, canary, reaper
+  main.py                     endpoints, job runner, SSE, canary, reaper, playlists
   db.py                       schema, pragmas, writer lock, uuid7, now()
-  extract.py                  yt-dlp resolve; runs in a subprocess
+  extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
   test_server.py              8 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
@@ -68,8 +74,8 @@ server/                       stateless transformer — never a media library
 |---|---|---|
 | `GET` | `/health` | |
 | `GET` | `/health/extractors` | canary, 6-hourly, 200/503 |
-| `POST` | `/resolve` | single items; playlists rejected in ~2s |
-| `POST` | `/items` | idempotent on (user, source); updates profile |
+| `POST` | `/resolve` | single item (JSON) or playlist (NDJSON stream) |
+| `POST` | `/items` | idempotent on (user, source); updates profile; optional `playlist_id` + per-entry `position` |
 | `GET` | `/items` | |
 | `DELETE` | `/items/{id}` | soft delete |
 | `GET` | `/jobs` | kept for curl; the client uses the stream |
@@ -77,6 +83,11 @@ server/                       stateless transformer — never a media library
 | `GET` | `/jobs/{id}/artifact/{filename}` | Range, token, `X-Artifact-SHA256` |
 | `DELETE` | `/jobs/{id}/artifact` | the collection acknowledgement |
 | `POST` | `/jobs/{id}/retry` | |
+| `POST` | `/playlists` | client-generated id, `ON CONFLICT DO NOTHING` — idempotent |
+| `GET` | `/playlists` | with ordered `{item_id, position}` per playlist |
+| `PATCH` | `/playlists/{id}` | rename |
+| `DELETE` | `/playlists/{id}` | soft delete |
+| `PUT` | `/playlists/{id}/items` | upsert/remove; position is opaque, client-generated (D-018) |
 
 ### The pipeline, verified end to end
 
@@ -99,11 +110,22 @@ All seven stages run. Evidence from real runs, not assertion:
 | v0.2 | 2 · re-download from `missing` restores playback | pass |
 | v0.2 | 3 · fifty queued items, UI not blocked | pass, **with a caveat** |
 | v0.2 | 4 · no `.part` masquerading as complete | pass |
+| v0.3 | 1 · assertions 9–14 of the offline test protocol | **NOT RUN on device** — see below |
+| v0.3 | 2 · 400-entry playlist streams with a running size estimate | not yet exercised against a real 400-entry playlist; the NDJSON parser is verified end-to-end for the single-item (one-line) case and the server-side flat-enumeration branch is verified with a mocked yt-dlp response |
+| v0.3 | 3 · 200-track offline reorder, one outbox row per move, replays after 4h | **mechanism** verified (create/rename/delete a playlist and delete an item while the server was down, then reconnected — outbox drained in order, server state matched); reorder specifically and the 4-hour/200-track scale were not exercised |
 
-Criterion 3's caveat: the 50 items were **synthetic artifacts** seeded by
-`server/scripts/seed_queue.py`, not fifty real fetches. It measured the client
-queue (51 items drained, zero long tasks over 50 ms). **The server has never
-been run at fifty concurrent real jobs.**
+Criterion 3's caveat (v0.2): the 50 items were **synthetic artifacts** seeded
+by `server/scripts/seed_queue.py`, not fifty real fetches. It measured the
+client queue (51 items drained, zero long tasks over 50 ms). **The server has
+never been run at fifty concurrent real jobs.**
+
+v0.3 was smoke-tested in a desktop Chrome browser only: create playlist →
+resolve → download → add to playlist → play from playlist → reorder buttons
+present → kill the server process → create/rename a playlist and delete an
+item offline → restart the server → reload → outbox drained and the server
+confirmed the mutations landed. That is the desktop analogue of the plane
+test the same way v0.2's "both origins killed" check was — **not** a
+substitute for the real device protocol, which has still never been run (§1).
 
 ### Verified with both origins killed
 
@@ -119,10 +141,6 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 
 | Phase | Scope | Notes |
 |---|---|---|
-| v0.3 | Playlist resolve-then-confirm with per-entry deselection | `/resolve` rejects playlists today. `extract_flat` is already enabled, which is the groundwork. |
-| v0.3 | Local playlists, fractional-index reordering | no `playlists` / `playlist_items` tables yet |
-| v0.3 | Offline mutation + outbox + replay | **nothing offline-writes today** |
-| v0.3 | Queue playback, next/prev prefetch | next/prev exist; prefetch of the *next* track's object URL does not |
 | v0.4 | Passkeys, invite codes, magic-link | one hardcoded dev user |
 | v0.4 | Per-user budgets, concurrency caps, usage ledger | `usage_ledger` table exists and is never written |
 | v0.4 | Multi-device sync, tombstones, LWW | `GET /sync` does not exist |
@@ -131,6 +149,22 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 | v1.0 | Video (`keep_video`), muxing, video view | pipeline rejects `keep_video` |
 | v1.0 | `ffmpeg.wasm` client transcode, COEP | |
 | v1.0 | Nightly `VACUUM INTO` backup | |
+
+### v0.3, built this session
+
+Playlist resolve-then-confirm (`/resolve` streams NDJSON for a playlist, one
+line per flat-enumerated entry, with per-entry deselection and a running
+`~X MB (estimate)` total in the confirm UI); local playlists with fractional-
+index reordering (`fractional-indexing` npm package, client-side only — see
+D-018); a real offline mutation outbox (`app/src/outbox.js`) that playlist
+create/rename/delete, playlist-item add/reorder/remove, and item delete all go
+through; and playing from a playlist makes next/previous cycle that
+playlist's live order instead of the whole downloaded library.
+
+Prefetch of the *next* track's object URL, called out separately in the build
+plan, needed no new code: every downloaded item's object URL is already
+resolved eagerly at boot (a v0.0-era decision), so the next track in any queue
+is never waiting on OPFS when playback reaches it.
 
 ### Built but knowingly incomplete
 
@@ -144,16 +178,19 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
   jump to 0.9. See D-017.
 - **`/jobs` is capped at 50 rows.** Fine for one user, wrong the moment a
   library is bigger than the queue view.
-- **Deletes are not offline-tolerant.** `forget()` fires `api.deleteItem` and
-  ignores failure. The outbox that makes this correct is v0.3.
 - **No auth anywhere.** Every endpoint acts as `DEV_USER_ID`. Do not put this
   on a public address.
+- **Deleting a library item doesn't cascade into playlists.** The
+  `playlist_items` row referencing it is left in place, both client and
+  server side — the UI hides it via a join against the live `items` mirror, so
+  nothing looks broken, but the rows accumulate. See D-018.
 
 ### Deferred shortcuts (`ponytail:` markers in code)
 
 | Where | Shortcut | Upgrade when |
 |---|---|---|
-| `app/src/db.svelte.js` | raw IndexedDB, no `idb` package | playlists + outbox arrive and there is a real migration |
+| `app/src/db.svelte.js` | raw IndexedDB, no `idb` package | playlists + outbox arrived in v0.3 on the same module — still no real migration need, just more stores |
+| `app/src/outbox.js` | re-reads the whole outbox store every drain loop instead of a cursor | the outbox ever grows unbounded (it shouldn't — it drains on every reconnect) |
 | `app/src/App.svelte` | artwork read from OPFS, not an IDB blob store | a sweep has thousands of items |
 | `app/src/App.svelte` | system font stack, no webfont | the design calls for a typeface — then woff2-in-bundle, FM-1 |
 | `app/src/sha256.js` | hand-written digest instead of a dependency | never, unless it proves wrong; it is pinned by vectors |
@@ -177,6 +214,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-015 | The artifact is a set of files, not one blob — `04-api.md` refined |
 | D-016 | Snapshot `$state` at the structured-clone boundary, not at call sites |
 | D-017 | Job progress travels as a file in scratch, not an IPC queue |
+| D-018 | Playlist position is opaque to the server (client-only fractional indexing); the outbox replays via existing idempotent REST calls, no idempotency-key ledger |
 
 ---
 
@@ -247,19 +285,24 @@ In the order I would actually do them:
 1. **Start the device clock.** Tunnel (`cloudflared tunnel --url
    http://localhost:4173`), add to the iPhone home screen, download two tracks,
    force-quit, leave it alone with the device low on free space. Five minutes of
-   work; it starts the only test that cannot be hurried.
-2. **Run the offline protocol** — `02-offline-playback.md` §5, assertions 1–14.
-   The readiness panel reports `persist()`, OPFS `move()`, and the fetch counter
-   directly on screen, so most assertions are readable without a debugger. The
-   two genuinely unknown answers are whether `persist()` returns true and
-   whether Safari supports OPFS `move()`.
-3. **Then v0.3**, starting with playlist resolve. `extract_flat` is already on;
-   `/resolve` needs to stream NDJSON instead of rejecting, and the client needs
-   the deselection UI with a running size total.
+   work; it starts the only test that cannot be hurried. Still true, still not
+   done — v0.3 was built on top of the same risk position v0.2 was.
+2. **Run the offline protocol** — `02-offline-playback.md` §5, all 14 assertions
+   now that v0.3 exists (9–14 need playlists specifically). The readiness panel
+   reports `persist()`, OPFS `move()`, and the fetch counter directly on screen,
+   so most assertions are readable without a debugger. The two genuinely
+   unknown answers are whether `persist()` returns true and whether Safari
+   supports OPFS `move()`.
+3. **Exercise a real playlist import.** Everything in v0.3 was checked against
+   a single downloaded track and mocked server responses; a real multi-hundred-
+   entry YouTube playlist has not gone through `/resolve` yet. That's the
+   remaining unknown in acceptance criterion v0.3-2.
 4. **Before v0.4, add migrations.** Accounts are the point where the database
    starts holding data that cannot be thrown away.
+5. **Decide whether to cascade-delete `playlist_items`** when a library item
+   is deleted (see D-018's known gap) before it accumulates in a real library.
 
 If step 1 fails — media does not survive on the device — stop and re-read
 `02-offline-playback.md` §2 before writing any more code. That is the scenario
 the phase ordering existed to catch early, and it would still be much cheaper to
-find out now than after v0.3.
+find out now than after v0.4.

@@ -2,27 +2,35 @@
 // zero-network boot possible; `local_media` is this device's private answer to
 // "do I actually have the bytes?" and never syncs. docs/03-data-model.md §4.
 //
-// ponytail: raw IndexedDB rather than the `idb` package. Two stores with
-// getAll/put/delete is ~20 lines; a dependency for that is not worth it.
-// Revisit when playlists and the outbox arrive and there is a real migration.
+// ponytail: raw IndexedDB rather than the `idb` package. A handful of stores
+// with getAll/put/delete is well under a hundred lines; a dependency for that
+// is not worth it. `playlists` / `playlist_items` / `outbox` arrived in v0.3
+// on the same raw-IndexedDB module rather than triggering the migration this
+// comment used to threaten — there still isn't a real schema migration need,
+// just three more object stores.
 
 const NAME = 'pwa-yt';
-const VERSION = 3;
+const VERSION = 4;
 
-// store name -> keyPath
+// store name -> IDBObjectStore options
 const STORES = {
-  items: 'id',
-  local_media: 'item_id',
-  meta: 'key', // last sync, last verification sweep
+  items: { keyPath: 'id' },
+  local_media: { keyPath: 'item_id' },
+  playlists: { keyPath: 'id' },
+  playlist_items: { keyPath: ['playlist_id', 'item_id'] },
+  // Queued offline mutations, replayed in `seq` order on reconnect. See
+  // outbox.js and docs/02-offline-playback.md §4.
+  outbox: { keyPath: 'seq', autoIncrement: true },
+  meta: { keyPath: 'key' }, // last sync, last verification sweep
 };
 
 function open() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(NAME, VERSION);
     req.onupgradeneeded = () => {
-      for (const [store, keyPath] of Object.entries(STORES)) {
+      for (const [store, opts] of Object.entries(STORES)) {
         if (!req.result.objectStoreNames.contains(store)) {
-          req.result.createObjectStore(store, { keyPath });
+          req.result.createObjectStore(store, opts);
         }
       }
     };

@@ -1,9 +1,12 @@
 <script>
   import { onMount } from 'svelte';
+  import { generateKeyBetween, generateNKeysBetween } from 'fractional-indexing';
   import * as db from './db.svelte.js';
   import * as api from './api.js';
   import { API } from './api.js';
   import { net } from './net.svelte.js';
+  import * as outbox from './outbox.js';
+  import { uuid7 } from './id.js';
 
   const ACTIVE = ['queued', 'fetching', 'transforming', 'ready'];
   const STAGE = {
@@ -24,6 +27,21 @@
   let plan = $state(null);
   let planError = $state(null);
   let resolving = $state(false);
+  // Set while `/resolve` is streaming a playlist: entries arrive one line at a
+  // time so a 400-entry playlist starts rendering long before the last one.
+  let playlistImport = $state(null);
+
+  let view = $state('library'); // 'library' | 'playlists'
+  let playlists = $state([]); // catalogue mirror, from IndexedDB
+  let playlistItems = $state([]); // raw playlist_items rows (incl. tombstones)
+  let openPlaylistId = $state(null); // which playlist's detail view is open
+  let newPlaylistName = $state('');
+  let editingPlaylistId = $state(null);
+  let editingName = $state('');
+  // Which playlist (if any) the currently-playing track's next/prev cycles
+  // through. null means "cycle through everything downloaded", the v0.2
+  // behaviour.
+  let queuePlaylistId = $state(null);
 
   // Sent with every add. Stored per item server-side, so re-adding the same
   // track at a different bitrate genuinely re-pulls it at that bitrate.
@@ -54,13 +72,54 @@
   const downloaded = $derived(items.filter((i) => media[i.id]?.state === 'present'));
   const verified = $derived(downloaded.filter((i) => media[i.id]?.verified_at).length);
 
+  const activePlaylists = $derived(
+    playlists.filter((p) => !p.deleted_at).sort((a, b) => a.created_at.localeCompare(b.created_at)),
+  );
+  const openPlaylist = $derived(activePlaylists.find((p) => p.id === openPlaylistId) ?? null);
+
+  // Rows (not resolved to items), sorted by fractional position, tombstones
+  // dropped. The one place every playlist-ordering read goes through.
+  function orderedPlaylistRows(playlistId) {
+    return playlistItems
+      .filter((pi) => pi.playlist_id === playlistId && !pi.deleted_at)
+      .sort((a, b) => a.position.localeCompare(b.position));
+  }
+  function orderedPlaylistItems(playlistId) {
+    return orderedPlaylistRows(playlistId)
+      .map((pi) => items.find((i) => i.id === pi.item_id))
+      .filter(Boolean);
+  }
+  const openPlaylistTracks = $derived(openPlaylistId ? orderedPlaylistItems(openPlaylistId) : []);
+
+  const importSelected = $derived(
+    playlistImport ? playlistImport.entries.filter((e) => !playlistImport.deselected[e.source_key]) : [],
+  );
+  const importSelectedBytes = $derived(
+    importSelected.reduce((sum, e) => sum + (e.estimated_bytes ?? 0), 0),
+  );
+
+  // Next/previous cycles the open playlist's *live* order when playing from
+  // one, so a reorder made mid-playback (the whole point of offline mutation)
+  // takes effect immediately rather than only on the next play.
+  function currentQueue() {
+    if (!queuePlaylistId) return downloaded;
+    return orderedPlaylistItems(queuePlaylistId).filter((i) => media[i.id]?.state === 'present');
+  }
+
   onMount(async () => {
     // The boot path. Local reads only — no fetch, no await on anything that
     // could hang. FM-2 is the most commonly missed failure mode and it is
     // missed exactly here.
-    const [catalogue, local] = await Promise.all([db.all('items'), db.all('local_media')]);
+    const [catalogue, local, pls, plItems] = await Promise.all([
+      db.all('items'),
+      db.all('local_media'),
+      db.all('playlists'),
+      db.all('playlist_items'),
+    ]);
     items = catalogue.sort((a, b) => b.added_at.localeCompare(a.added_at));
     for (const row of local) media[row.item_id] = row;
+    playlists = pls;
+    playlistItems = plItems;
     booted = true;
 
     navigator.storage.persisted().then((v) => (persisted = v));
@@ -91,7 +150,12 @@
     queueMicrotask(() => {
       startPolling();
       runSweep();
+      outbox.drainOnce();
     });
+
+    // The other trigger for draining queued offline mutations — reconnect can
+    // happen with the app already open and idle, not just at boot.
+    window.addEventListener('online', () => outbox.drainOnce());
   });
 
   async function refreshStorage() {
@@ -101,14 +165,38 @@
   }
 
   // ------------------------------------------------------------------ adding
+  //
+  // Resolving and importing brand-new content is not an offline operation —
+  // there is nothing to download without a network — so unlike everything in
+  // the "playlists" section below, none of this goes through the outbox. A
+  // failure here just means "try again", not "queue for later".
 
   async function doResolve() {
     if (!urlInput.trim()) return;
     resolving = true;
     planError = null;
     plan = null;
+    playlistImport = null;
     try {
-      plan = (await api.resolveUrl(urlInput.trim(), $state.snapshot(profile))).entry;
+      await api.streamResolve(urlInput.trim(), $state.snapshot(profile), {
+        onLine(line) {
+          if (line.kind === 'item') {
+            plan = line.entry;
+          } else if (line.kind === 'playlist_head') {
+            playlistImport = {
+              title: line.title,
+              entryCount: line.entry_count,
+              entries: [],
+              deselected: {}, // source_key -> true, for per-entry deselection
+              done: false,
+            };
+          } else if (line.kind === 'entry') {
+            playlistImport.entries.push(line);
+          } else if (line.kind === 'playlist_done') {
+            playlistImport.done = true;
+          }
+        },
+      });
     } catch (err) {
       planError = err.message;
     } finally {
@@ -138,6 +226,160 @@
     }
   }
 
+  function toggleImportEntry(sourceKey) {
+    if (playlistImport.deselected[sourceKey]) delete playlistImport.deselected[sourceKey];
+    else playlistImport.deselected[sourceKey] = true;
+  }
+
+  async function confirmPlaylistImport() {
+    const imp = playlistImport;
+    playlistImport = null;
+    const selected = imp.entries.filter((e) => !imp.deselected[e.source_key]);
+    if (!selected.length) return;
+
+    try {
+      const playlistId = uuid7();
+      await api.createPlaylist(playlistId, imp.title);
+
+      const positions = generateNKeysBetween(null, null, selected.length);
+      const entries = selected.map((e, i) => ({
+        source_key: e.source_key,
+        format_profile: $state.snapshot(profile),
+        position: positions[i],
+      }));
+      const created = (await api.createItems(entries, playlistId)).items;
+
+      const stamp = new Date().toISOString();
+      const playlistRow = { id: playlistId, name: imp.title, created_at: stamp, updated_at: stamp };
+      await db.put('playlists', playlistRow);
+      playlists = [...playlists, playlistRow];
+
+      for (let i = 0; i < created.length; i++) {
+        const src = selected[i];
+        const itemRow = {
+          id: created[i].item_id,
+          source_key: src.source_key,
+          title: src.title,
+          uploader: src.uploader,
+          duration_s: src.duration_s,
+          added_at: stamp,
+        };
+        await db.put('items', itemRow);
+        items = [itemRow, ...items.filter((it) => it.id !== itemRow.id)];
+
+        const piRow = {
+          playlist_id: playlistId,
+          item_id: created[i].item_id,
+          position: positions[i],
+          updated_at: stamp,
+          deleted_at: null,
+        };
+        await db.put('playlist_items', piRow);
+        playlistItems = [...playlistItems, piRow];
+      }
+      urlInput = '';
+      openPlaylistId = playlistId;
+      view = 'playlists';
+      startPolling();
+    } catch (err) {
+      planError = err.message;
+    }
+  }
+
+  // -------------------------------------------------------------- playlists
+  //
+  // Everything here writes to IndexedDB first and unconditionally — offline
+  // mutation (02-offline-playback.md §4) means these must work with zero
+  // network at all. `mutate()` then makes a best-effort server call and, if
+  // that fails, queues the same mutation in the outbox for later — every
+  // mutation kind it's used for is naturally safe to replay (see outbox.js).
+
+  async function mutate(kind, payload, apply) {
+    try {
+      await apply();
+      outbox.drainOnce(); // if that succeeded we're online; flush anything queued
+    } catch {
+      await outbox.enqueue(kind, payload);
+    }
+  }
+
+  async function createPlaylistLocal() {
+    const name = newPlaylistName.trim();
+    if (!name) return;
+    newPlaylistName = '';
+    const id = uuid7();
+    const stamp = new Date().toISOString();
+    const row = { id, name, created_at: stamp, updated_at: stamp };
+    await db.put('playlists', row);
+    playlists = [...playlists, row];
+    await mutate('playlist_create', { id, name }, () => api.createPlaylist(id, name));
+  }
+
+  async function renamePlaylistLocal(playlist, name) {
+    name = name.trim();
+    if (!name || name === playlist.name) return;
+    const row = { ...playlist, name, updated_at: new Date().toISOString() };
+    await db.put('playlists', row);
+    playlists = playlists.map((p) => (p.id === row.id ? row : p));
+    await mutate('playlist_rename', { id: row.id, name }, () => api.renamePlaylist(row.id, name));
+  }
+
+  async function deletePlaylistLocal(playlist) {
+    const stamp = new Date().toISOString();
+    const row = { ...playlist, deleted_at: stamp, updated_at: stamp };
+    await db.put('playlists', row);
+    playlists = playlists.map((p) => (p.id === row.id ? row : p));
+    if (openPlaylistId === row.id) openPlaylistId = null;
+    if (queuePlaylistId === row.id) queuePlaylistId = null;
+    await mutate('playlist_delete', { id: row.id }, () => api.deletePlaylist(row.id));
+  }
+
+  async function addToPlaylist(playlist, item) {
+    const last = orderedPlaylistRows(playlist.id).at(-1);
+    const position = generateKeyBetween(last?.position ?? null, null);
+    await upsertPlaylistItem(playlist.id, item.id, position);
+  }
+
+  async function moveInPlaylist(playlist, item, direction) {
+    const ordered = orderedPlaylistRows(playlist.id);
+    const idx = ordered.findIndex((pi) => pi.item_id === item.id);
+    const j = idx + direction;
+    if (idx < 0 || j < 0 || j >= ordered.length) return;
+    const position =
+      direction < 0
+        ? generateKeyBetween(ordered[j - 1]?.position ?? null, ordered[j].position)
+        : generateKeyBetween(ordered[j].position, ordered[j + 1]?.position ?? null);
+    await upsertPlaylistItem(playlist.id, item.id, position);
+  }
+
+  async function upsertPlaylistItem(playlistId, itemId, position) {
+    const stamp = new Date().toISOString();
+    const row = { playlist_id: playlistId, item_id: itemId, position, updated_at: stamp, deleted_at: null };
+    await db.put('playlist_items', row);
+    playlistItems = [...playlistItems.filter((pi) => !(pi.playlist_id === playlistId && pi.item_id === itemId)), row];
+    await mutate(
+      'playlist_items_patch',
+      { playlist_id: playlistId, upserts: [{ item_id: itemId, position }], removes: [] },
+      () => api.patchPlaylistItems(playlistId, [{ item_id: itemId, position }], []),
+    );
+  }
+
+  async function removeFromPlaylist(playlist, item) {
+    const existing = playlistItems.find((pi) => pi.playlist_id === playlist.id && pi.item_id === item.id);
+    if (!existing) return;
+    const stamp = new Date().toISOString();
+    const row = { ...existing, deleted_at: stamp, updated_at: stamp };
+    await db.put('playlist_items', row);
+    playlistItems = playlistItems.map((pi) =>
+      pi.playlist_id === row.playlist_id && pi.item_id === row.item_id ? row : pi,
+    );
+    await mutate(
+      'playlist_items_patch',
+      { playlist_id: playlist.id, upserts: [], removes: [item.id] },
+      () => api.patchPlaylistItems(playlist.id, [], [item.id]),
+    );
+  }
+
   // ------------------------------------------------------------------- jobs
 
   function startPolling() {
@@ -156,6 +398,7 @@
   function applyJobs(data) {
     lastSync = new Date().toISOString();
     db.setMeta('last_sync', lastSync);
+    outbox.drainOnce(); // a live jobs stream is proof we're online right now
 
     let busy = false;
     for (const job of data.jobs) {
@@ -354,19 +597,24 @@
     delete media[item.id];
     items = items.filter((i) => i.id !== item.id);
     refreshStorage();
-    // Offline-tolerant by accident, not by design. The outbox is v0.3.
-    api.deleteItem(item.id).catch(() => {});
+    await mutate('item_delete', { id: item.id }, () => api.deleteItem(item.id));
   }
 
   // ---------------------------------------------------------------- playback
 
-  function play(item) {
+  // `playlistId` is null for "play from the library" (cycles `downloaded`,
+  // the v0.2 behaviour); otherwise next/previous cycle that playlist's live
+  // order instead. Object URLs for every downloaded item are already resolved
+  // at boot (see `resolveUrls` below), so the next track in either queue is
+  // never waiting on OPFS when playback reaches it.
+  function play(item, playlistId = null) {
     const url = urls[item.id]?.audio;
     if (!url) return;
     // Everything here is synchronous so the iOS gesture still counts.
     if (playingId !== item.id) {
       audio.src = url;
       playingId = item.id;
+      queuePlaylistId = playlistId;
       setMetadata(item);
     }
     audio.play();
@@ -380,9 +628,10 @@
   }
 
   function step(delta) {
-    if (!downloaded.length) return;
-    const i = downloaded.findIndex((c) => c.id === playingId);
-    play(downloaded[(i + delta + downloaded.length) % downloaded.length]);
+    const list = currentQueue();
+    if (!list.length) return;
+    const i = list.findIndex((c) => c.id === playingId);
+    play(list[(i + delta + list.length) % list.length], queuePlaylistId);
   }
 
   function setMetadata(item) {
@@ -391,7 +640,7 @@
     navigator.mediaSession.metadata = new MediaMetadata({
       title: item.title ?? 'Unknown',
       artist: item.uploader ?? '',
-      album: 'Library',
+      album: (queuePlaylistId && activePlaylists.find((p) => p.id === queuePlaylistId)?.name) || 'Library',
       // Must be a local object URL. A remote artwork URL blanks the lock screen
       // offline, which is the whole point of doing this at all.
       artwork: art ? [{ src: art, sizes: '512x512', type: 'image/jpeg' }] : [],
@@ -487,7 +736,7 @@
 ></audio>
 
 <main>
-  <h1>PWA-YT <span class="ver">v0.2</span></h1>
+  <h1>PWA-YT <span class="ver">v0.3</span></h1>
 
   <form
     class="add"
@@ -561,48 +810,205 @@
     </section>
   {/if}
 
+  {#if playlistImport}
+    <!-- Entries stream in as yt-dlp's flat enumeration produces them, so a
+         400-entry playlist starts rendering well before it finishes. -->
+    <section class="plan">
+      <input
+        class="playlist-title"
+        bind:value={playlistImport.title}
+        aria-label="Playlist name"
+      />
+      <span class="dim">
+        {playlistImport.entries.length}{playlistImport.done
+          ? ''
+          : ` of ${playlistImport.entryCount}`} tracks found{playlistImport.done ? '' : ' · resolving…'}
+      </span>
+      <span class="dim">{importSelected.length} selected · ~{mb(importSelectedBytes)} (estimate)</span>
+      <ul class="import-list">
+        {#each playlistImport.entries as e (e.source_key)}
+          <li>
+            <label>
+              <input
+                type="checkbox"
+                checked={!playlistImport.deselected[e.source_key]}
+                onchange={() => toggleImportEntry(e.source_key)}
+              />
+              <span class="title">{e.title ?? e.source_key}</span>
+              <span class="dim">
+                {clock(e.duration_s)}{e.already_in_library ? ' · already in library' : ''}
+              </span>
+            </label>
+          </li>
+        {/each}
+      </ul>
+      <div class="actions">
+        <button onclick={confirmPlaylistImport} disabled={!importSelected.length}>
+          Import {importSelected.length} track{importSelected.length === 1 ? '' : 's'}
+        </button>
+        <button class="ghost" onclick={() => (playlistImport = null)}>Cancel</button>
+      </div>
+    </section>
+  {/if}
+
   {#if !booted}
     <p class="dim">Reading local catalogue…</p>
   {:else}
-    <ul class="library">
-      {#each items as item (item.id)}
-        {@const job = jobs[item.id]}
-        {@const pct = progress[item.id]}
-        <li class:active={playingId === item.id}>
-          <div class="art">
-            {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
-          </div>
-          <div class="meta">
-            <strong>{item.title}</strong>
-            <span class="dim">
-              {item.uploader} · {clock(item.duration_s)}
-              {#if media[item.id]?.state === 'missing'} · not downloaded{/if}
-            </span>
-            {#if errors[item.id]}<span class="err">{errors[item.id]}</span>{/if}
-          </div>
-          <div class="actions">
-            {#if pct !== undefined}
-              <span class="dim">{Math.round(pct * 100)}% to device</span>
-            {:else if media[item.id]?.state === 'present'}
-              <button onclick={() => play(item)}>Play</button>
-              <button class="ghost" onclick={() => forget(item)}>Delete</button>
-            {:else if job && ACTIVE.includes(job.state)}
+    <div class="tabs">
+      <button class:active={view === 'library'} onclick={() => (view = 'library')}>Library</button>
+      <button class:active={view === 'playlists'} onclick={() => (view = 'playlists')}>
+        Playlists{activePlaylists.length ? ` (${activePlaylists.length})` : ''}
+      </button>
+    </div>
+
+    {#if view === 'library'}
+      <ul class="library">
+        {#each items as item (item.id)}
+          {@const job = jobs[item.id]}
+          {@const pct = progress[item.id]}
+          <li class:active={playingId === item.id}>
+            <div class="art">
+              {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
+            </div>
+            <div class="meta">
+              <strong>{item.title}</strong>
               <span class="dim">
-                {STAGE[job.state]}{job.progress ? ` ${Math.round(job.progress * 100)}%` : ''}…
+                {item.uploader} · {clock(item.duration_s)}
+                {#if media[item.id]?.state === 'missing'} · not downloaded{/if}
               </span>
-            {:else if job?.state === 'failed'}
-              <button onclick={() => retry(item)}>Retry</button>
-              <button class="ghost" onclick={() => forget(item)}>Delete</button>
-            {:else}
-              <button onclick={() => redownload(item)}>Download</button>
-              <button class="ghost" onclick={() => forget(item)}>Delete</button>
-            {/if}
-          </div>
-        </li>
-      {:else}
-        <li class="empty dim">Nothing here yet. Paste a link above.</li>
-      {/each}
-    </ul>
+              {#if errors[item.id]}<span class="err">{errors[item.id]}</span>{/if}
+            </div>
+            <div class="actions">
+              {#if pct !== undefined}
+                <span class="dim">{Math.round(pct * 100)}% to device</span>
+              {:else if media[item.id]?.state === 'present'}
+                <button onclick={() => play(item, null)}>Play</button>
+                <button class="ghost" onclick={() => forget(item)}>Delete</button>
+              {:else if job && ACTIVE.includes(job.state)}
+                <span class="dim">
+                  {STAGE[job.state]}{job.progress ? ` ${Math.round(job.progress * 100)}%` : ''}…
+                </span>
+              {:else if job?.state === 'failed'}
+                <button onclick={() => retry(item)}>Retry</button>
+                <button class="ghost" onclick={() => forget(item)}>Delete</button>
+              {:else}
+                <button onclick={() => redownload(item)}>Download</button>
+                <button class="ghost" onclick={() => forget(item)}>Delete</button>
+              {/if}
+              {#if activePlaylists.length}
+                <select
+                  class="add-to-playlist"
+                  aria-label="Add to playlist"
+                  onchange={(e) => {
+                    const pl = activePlaylists.find((p) => p.id === e.currentTarget.value);
+                    e.currentTarget.value = '';
+                    if (pl) addToPlaylist(pl, item);
+                  }}
+                >
+                  <option value="" disabled selected>Add to…</option>
+                  {#each activePlaylists as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
+                </select>
+              {/if}
+            </div>
+          </li>
+        {:else}
+          <li class="empty dim">Nothing here yet. Paste a link above.</li>
+        {/each}
+      </ul>
+    {:else if !openPlaylist}
+      <form
+        class="add"
+        onsubmit={(e) => {
+          e.preventDefault();
+          createPlaylistLocal();
+        }}
+      >
+        <input bind:value={newPlaylistName} placeholder="New playlist name" aria-label="Playlist name" />
+        <button type="submit" disabled={!newPlaylistName.trim()}>Create</button>
+      </form>
+      <ul class="library">
+        {#each activePlaylists as p (p.id)}
+          <li>
+            <div
+              class="meta"
+              onclick={() => (openPlaylistId = p.id)}
+              onkeydown={(e) => e.key === 'Enter' && (openPlaylistId = p.id)}
+              role="button"
+              tabindex="0"
+            >
+              <strong>{p.name}</strong>
+              <span class="dim">{orderedPlaylistItems(p.id).length} tracks</span>
+            </div>
+            <div class="actions">
+              <button
+                class="ghost"
+                onclick={() => {
+                  editingPlaylistId = p.id;
+                  editingName = p.name;
+                }}
+              >
+                Rename
+              </button>
+              <button class="ghost" onclick={() => deletePlaylistLocal(p)}>Delete</button>
+            </div>
+          </li>
+          {#if editingPlaylistId === p.id}
+            <li>
+              <form
+                class="add"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  renamePlaylistLocal(p, editingName);
+                  editingPlaylistId = null;
+                }}
+              >
+                <input bind:value={editingName} aria-label="Rename playlist" />
+                <button type="submit">Save</button>
+                <button type="button" class="ghost" onclick={() => (editingPlaylistId = null)}>
+                  Cancel
+                </button>
+              </form>
+            </li>
+          {/if}
+        {:else}
+          <li class="empty dim">No playlists yet.</li>
+        {/each}
+      </ul>
+    {:else}
+      <div class="row">
+        <button class="ghost" onclick={() => (openPlaylistId = null)}>‹ Playlists</button>
+        <strong>{openPlaylist.name}</strong>
+        <button class="ghost" onclick={() => deletePlaylistLocal(openPlaylist)}>Delete</button>
+      </div>
+      <ul class="library">
+        {#each openPlaylistTracks as item, i (item.id)}
+          <li class:active={playingId === item.id}>
+            <div class="art">
+              {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
+            </div>
+            <div class="meta">
+              <strong>{item.title}</strong>
+              <span class="dim">
+                {item.uploader} · {clock(item.duration_s)}
+                {#if media[item.id]?.state !== 'present'} · not downloaded{/if}
+              </span>
+            </div>
+            <div class="actions">
+              <button onclick={() => moveInPlaylist(openPlaylist, item, -1)} disabled={i === 0}>↑</button>
+              <button onclick={() => moveInPlaylist(openPlaylist, item, 1)} disabled={i === openPlaylistTracks.length - 1}>
+                ↓
+              </button>
+              {#if media[item.id]?.state === 'present'}
+                <button onclick={() => play(item, openPlaylist.id)}>Play</button>
+              {/if}
+              <button class="ghost" onclick={() => removeFromPlaylist(openPlaylist, item)}>Remove</button>
+            </div>
+          </li>
+        {:else}
+          <li class="empty dim">No tracks yet — add some from the Library tab.</li>
+        {/each}
+      </ul>
+    {/if}
 
     {#if playing}
       <section class="player">
@@ -762,6 +1168,66 @@
   }
   .plan .actions {
     margin-top: 0.5rem;
+  }
+  .playlist-title {
+    font: inherit;
+    font-weight: 600;
+    padding: 0.25rem 0.4rem;
+    margin-bottom: 0.15rem;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+  }
+  .playlist-title:hover,
+  .playlist-title:focus {
+    border-color: #33333a;
+    background: #0b0b0c;
+  }
+  .import-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.5rem 0;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .import-list li {
+    padding: 0.3rem 0;
+    border-bottom: 1px solid #232327;
+  }
+  .import-list label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .import-list .title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+  }
+  .tabs button {
+    background: #16161a;
+    color: #8b8b94;
+  }
+  .tabs button.active {
+    background: #2f6feb;
+    color: #fff;
+  }
+  .add-to-playlist {
+    font: inherit;
+    min-height: 44px;
+    max-width: 8rem;
+    background: #232327;
+    color: #c8c8d0;
+    border: 0;
+    border-radius: 6px;
   }
   .library {
     list-style: none;
