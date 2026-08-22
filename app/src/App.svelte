@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
   import { generateKeyBetween, generateNKeysBetween } from 'fractional-indexing';
   import * as db from './db.svelte.js';
   import * as api from './api.js';
@@ -61,6 +62,20 @@
   let duration = $state(0);
   let booted = $state(false);
 
+  // Read from IndexedDB at boot, never fetched to render — FM-2. `null` means
+  // no local session at all, which is the only case that blocks the library
+  // view; an *expired* session still shows the library, read-only. See FM-2
+  // and D-019's note on this device's local catalogue not being namespaced
+  // per user (fine for one person/one device, a real gap on a shared one).
+  let session = $state(null); // { token, expires_at, user } | null
+  let readOnly = $state(false);
+  let authView = $state('login'); // 'login' | 'register'
+  let authBusy = $state(false);
+  let authError = $state(null);
+  let inviteCode = $state('');
+  let authEmail = $state('');
+  let authDisplayName = $state('');
+
   let audio; // ONE element for the app's lifetime. FM-5: a fresh element per
   // track loses the iOS gesture unlock and playback dies once backgrounded.
   let worker;
@@ -120,6 +135,19 @@
     for (const row of local) media[row.item_id] = row;
     playlists = pls;
     playlistItems = plItems;
+
+    session = await db.getMeta('session');
+    if (session) {
+      api.setAuthToken(session.token);
+      // Expired offline degrades to read-only, it does not log out — FM-2.
+      // A later successful request (once back online) clears this the same
+      // way any other 401 would, by prompting a fresh sign-in.
+      if (session.expires_at < new Date().toISOString()) readOnly = true;
+    }
+    api.setUnauthorizedHandler(() => {
+      readOnly = true;
+    });
+
     booted = true;
 
     navigator.storage.persisted().then((v) => (persisted = v));
@@ -162,6 +190,64 @@
     if (!navigator.storage?.estimate) return;
     const { usage, quota } = await navigator.storage.estimate();
     storage = { usage, quota };
+  }
+
+  // ------------------------------------------------------------------- auth
+  //
+  // Usernameless throughout: no username/email field at sign-in, just a
+  // passkey prompt. `startRegistration`/`startAuthentication` are
+  // @simplewebauthn/browser — they turn the server's JSON options into the
+  // ArrayBuffers `navigator.credentials.create()/.get()` need and back again,
+  // so nothing here touches base64url by hand. See D-019.
+
+  async function applySession(result) {
+    session = { token: result.token, expires_at: result.expires_at, user: result.user };
+    await db.setMeta('session', session);
+    api.setAuthToken(session.token);
+    readOnly = false;
+    authError = null;
+    startPolling();
+  }
+
+  async function doRegister() {
+    authError = null;
+    authBusy = true;
+    try {
+      const begin = await api.registerBegin(inviteCode.trim(), authEmail.trim(), authDisplayName.trim());
+      const credential = await startRegistration({ optionsJSON: begin.options });
+      const result = await api.registerFinish(begin.ceremony_id, credential);
+      await applySession(result);
+    } catch (err) {
+      authError = err.message;
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function doLogin() {
+    authError = null;
+    authBusy = true;
+    try {
+      const begin = await api.loginBegin();
+      const credential = await startAuthentication({ optionsJSON: begin.options });
+      const result = await api.loginFinish(begin.ceremony_id, credential);
+      await applySession(result);
+    } catch (err) {
+      authError = err.message;
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function doLogout() {
+    await api.logout();
+    // Clears only the session — items, local_media, artwork, and OPFS are
+    // untouched. Logging out must never look like data loss. See FM-2.
+    await db.remove('meta', 'session');
+    session = null;
+    readOnly = false;
+    api.setAuthToken(null);
+    stopPolling();
   }
 
   // ------------------------------------------------------------------ adding
@@ -753,7 +839,56 @@
 ></audio>
 
 <main>
-  <h1>PWA-YT <span class="ver">v0.3</span></h1>
+  <h1>PWA-YT <span class="ver">v0.4</span></h1>
+
+  {#if !booted}
+    <p class="dim">Reading local catalogue…</p>
+  {:else if !session}
+    <!-- Usernameless: no username/email field here at all. The authenticator's
+         own passkey picker is the entire sign-in UI. -->
+    <section class="auth">
+      {#if authError}<p class="err">{authError}</p>{/if}
+      {#if authView === 'register'}
+        <h2>Create your account</h2>
+        <input placeholder="Invite code" bind:value={inviteCode} aria-label="Invite code" />
+        <input
+          type="email"
+          placeholder="Email"
+          bind:value={authEmail}
+          aria-label="Email"
+        />
+        <input
+          placeholder="Display name (optional)"
+          bind:value={authDisplayName}
+          aria-label="Display name"
+        />
+        <button onclick={doRegister} disabled={authBusy || !inviteCode.trim() || !authEmail.trim()}>
+          {authBusy ? 'Creating…' : 'Create account with a passkey'}
+        </button>
+        <button class="ghost" onclick={() => (authView = 'login')}>
+          Already have an account? Sign in
+        </button>
+      {:else}
+        <h2>Sign in</h2>
+        <button onclick={doLogin} disabled={authBusy}>
+          {authBusy ? 'Signing in…' : 'Sign in with a passkey'}
+        </button>
+        <button class="ghost" onclick={() => (authView = 'register')}>
+          Have an invite code? Register
+        </button>
+      {/if}
+    </section>
+  {:else}
+    {#if readOnly}
+      <p class="err">
+        Session expired — sign in again once you're back online. Your library
+        is still here either way; nothing local was touched.
+      </p>
+    {/if}
+    <div class="row account">
+      <span class="dim">{session.user.display_name || session.user.email}</span>
+      <button class="ghost" onclick={doLogout}>Sign out</button>
+    </div>
 
   <form
     class="add"
@@ -868,9 +1003,6 @@
     </section>
   {/if}
 
-  {#if !booted}
-    <p class="dim">Reading local catalogue…</p>
-  {:else}
     <div class="tabs">
       <button class:active={view === 'library'} onclick={() => (view = 'library')}>Library</button>
       <button class:active={view === 'playlists'} onclick={() => (view = 'playlists')}>
@@ -1314,6 +1446,33 @@
   button.wide {
     width: 100%;
     margin: 0.5rem 0;
+  }
+  .auth {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-width: 22rem;
+    margin: 2rem auto;
+    padding: 1.25rem;
+    background: #16161a;
+    border: 1px solid #33333a;
+    border-radius: 8px;
+  }
+  .auth h2 {
+    margin: 0 0 0.25rem;
+  }
+  .auth input {
+    font: inherit;
+    min-height: 44px;
+    padding: 0 0.75rem;
+    border: 1px solid #33333a;
+    border-radius: 6px;
+    background: #0b0b0c;
+    color: inherit;
+  }
+  .row.account {
+    justify-content: space-between;
+    margin-bottom: 1rem;
   }
   .format {
     margin-bottom: 1rem;

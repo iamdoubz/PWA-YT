@@ -1,12 +1,15 @@
 # Build status
 
-**As of:** 2026-08-22 · commit `3156c5f` + uncommitted v0.3 work (playlists, outbox)
+**As of:** 2026-08-22 · commit `15f94da` + uncommitted v0.4 work (auth foundation)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
-**Phases claimed complete:** v0.0 (added), v0.1, v0.2. v0.3 is built and smoke-tested
-in a desktop browser (server killed/restarted to simulate reconnect) but **not**
-run through the real offline test protocol on a device — same risk position as
-v0.1/v0.2, see §1.
-**Verified on:** desktop Chrome only
+**Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3. v0.4 is **partial by
+design** — see §1a. The auth *foundation* (passkeys, invite codes, sessions,
+every endpoint scoped per-user) is built; per-user budgets, multi-device sync,
+the cookie jar, and 429 backoff were deliberately left for a follow-up pass,
+at the owner's explicit choice.
+**Verified on:** desktop Chrome only. The WebAuthn ceremony itself reaches a
+real native passkey prompt (confirmed live) but has not been completed
+end-to-end — see §1a.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -37,6 +40,50 @@ be started retroactively.
 
 ---
 
+## 1a. v0.4 is intentionally partial, and the passkey ceremony is unverified end-to-end
+
+v0.4 bundles five fairly independent subsystems (`06-build-plan.md`). Asked
+up front how to sequence them, the owner chose **foundation first, then
+pause for review**: passkeys + invite codes + sessions + every endpoint
+scoped to the authenticated user, stop there. Per-user budgets/usage ledger,
+multi-device `/sync`, the encrypted cookie jar, and 429 backoff/circuit-
+breaker are **not built** — this is a deliberate, agreed stopping point, not
+a phase abandoned partway through.
+
+**The WebAuthn ceremony has not been completed live.** Testing it end-to-end
+needs a real authenticator (Windows Hello, Touch ID, or a security key)
+responding to a native OS prompt — the same category of thing the device gate
+in §1 already can't do from this sandbox, for the same reason: it needs a
+human at the keyboard, not another round of automation. What *was* verified
+live, in a real browser:
+
+- The sign-in/register screen renders with zero network calls (FM-2), and is
+  usernameless — no username field anywhere, by design (D-019).
+- `navigator.credentials.create()` correctly rejects `127.0.0.1` as an invalid
+  WebAuthn domain (a real spec rule, not a bug) — retrying through `localhost`
+  cleared that and reached the real ceremony.
+- Registration begin → the browser's native passkey prompt actually opened
+  (`document.visibilityState` flipped to `'hidden'` with `hasFocus()` still
+  `true` — the tab yielding to a real OS-level dialog, not a JS error).
+  Automation has no way to drive that dialog (it's outside the DOM/CDP
+  entirely), so the ceremony was abandoned there rather than forced through.
+- Abandoning it left **no trace**: the invite code stayed unused, no partial
+  user row was created. That's `finish_registration`'s transaction working
+  as designed, not luck.
+- Every server-side auth code path that doesn't need a real signature —
+  invite validation (unknown/used codes), session create/validate/expire/
+  logout, ceremony single-use/expiry — is covered by
+  `test_server.py` and passes.
+
+**What this means for acceptance criterion v0.4-1** ("two users cannot see or
+affect each other's items, jobs, scratch, or cookies"): every query in
+`main.py` is now scoped by the authenticated user's id (verified by reading
+the code, and by the unauthenticated-request tests returning 401), but this
+has not been proven with **two real accounts** signing in and checking they
+can't see each other's data — that needs a completed registration first.
+
+---
+
 ## 2. What exists
 
 Eight commits, ~22 source files, two processes.
@@ -53,6 +100,8 @@ app/                          the PWA — owns all durable media
   src/outbox.js                offline mutation queue; replays on reconnect
   src/id.js                    client uuid7() for offline-created playlists
   src/opfs-worker.js          the ONLY thing that touches OPFS
+  # auth: no separate module — bearer token + auth calls live in api.js,
+  # sign-in/register UI lives in App.svelte alongside everything else
   src/sha256.js               incremental digest (Web Crypto has none)
   src/net.svelte.js           fetch counter for assertion 12
   scripts/check-no-cdn.js     build gate: absolute URLs in dist/ fail
@@ -62,10 +111,12 @@ app/                          the PWA — owns all durable media
 server/                       stateless transformer — never a media library
   main.py                     endpoints, job runner, SSE, canary, reaper, playlists
   db.py                       schema, pragmas, writer lock, uuid7, now()
+  auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              8 checks, plain asserts, no pytest
+  test_server.py              13 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
+  scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
 
 ### Endpoints implemented
@@ -88,6 +139,19 @@ server/                       stateless transformer — never a media library
 | `PATCH` | `/playlists/{id}` | rename |
 | `DELETE` | `/playlists/{id}` | soft delete |
 | `PUT` | `/playlists/{id}/items` | upsert/remove; position is opaque, client-generated (D-018) |
+| `POST` | `/auth/register/begin` | `{invite_code, email, display_name?}` → `{ceremony_id, options}` |
+| `POST` | `/auth/register/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}` |
+| `POST` | `/auth/login/begin` | usernameless — no body, empty `allowCredentials` |
+| `POST` | `/auth/login/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}` |
+| `POST` | `/auth/logout` | invalidates the session server-side only |
+
+Every endpoint above `/auth/*`, `/health`, and `/health/extractors` now
+requires a valid bearer session (`Depends(auth.current_user)`) and scopes its
+query by that user's id — including the playlist endpoints, which previously
+had **no ownership check at all** on `PUT /playlists/{id}/items` (anyone
+could patch any playlist by id). Fixed as part of this pass, not a
+regression introduced by it — v0.3 had no auth at all yet, so there was
+nothing to check against.
 
 ### The pipeline, verified end to end
 
@@ -113,6 +177,10 @@ All seven stages run. Evidence from real runs, not assertion:
 | v0.3 | 1 · assertions 9–14 of the offline test protocol | **NOT RUN on device** — see below |
 | v0.3 | 2 · playlist streams with a running size estimate | pass, **with a caveat** — real 2-track playlist, not 400 entries |
 | v0.3 | 3 · 200-track offline reorder, one outbox row per move, replays after 4h | **mechanism** verified (create/rename/delete a playlist and delete an item while the server was down, then reconnected — outbox drained in order, server state matched); reorder specifically and the 4-hour/200-track scale were not exercised |
+| v0.4 | 1 · two users can't see/affect each other's items, jobs, scratch | **code-scoped, not proven** — every query filters by the authenticated user's id; not demonstrated with two real signed-in accounts (needs a completed passkey ceremony first, see §1a) |
+| v0.4 | 2 · expired session offline → read-only, not logout | built (`readOnly` flag on a 401 or a locally-expired `expires_at`; `db.remove('meta','session')` is the *only* thing logout touches) but not exercised against a real expired session |
+| v0.4 | 3 · one user's full queue doesn't delay another's jobs | **inherited, not new** — the per-user `max_concurrent` correlated subquery in `_claim()` has been there since v0.1; only meaningfully testable with two real accounts each queuing jobs |
+| v0.4 | 4 · same account converges across two devices | **not built** — this is `/sync`, explicitly deferred past the foundation pass |
 
 Criterion 3's caveat (v0.2): the 50 items were **synthetic artifacts** seeded
 by `server/scripts/seed_queue.py`, not fifty real fetches. It measured the
@@ -158,14 +226,38 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 
 | Phase | Scope | Notes |
 |---|---|---|
-| v0.4 | Passkeys, invite codes, magic-link | one hardcoded dev user |
-| v0.4 | Per-user budgets, concurrency caps, usage ledger | `usage_ledger` table exists and is never written |
+| v0.4 | Magic-link fallback | deferred within the foundation pass itself, not just unstarted — see 04-api.md |
+| v0.4 | Per-user budgets, concurrency caps, usage ledger | concurrency cap has worked since v0.1 (`_claim()`'s correlated subquery); `daily_byte_budget` is a column nothing reads yet, `usage_ledger` exists and is never written |
 | v0.4 | Multi-device sync, tombstones, LWW | `GET /sync` does not exist |
 | v0.4 | Encrypted cookie jar | |
 | v0.4 | Backoff, jitter, circuit breaker on 429s | |
 | v1.0 | Video (`keep_video`), muxing, video view | pipeline rejects `keep_video` |
 | v1.0 | `ffmpeg.wasm` client transcode, COEP | |
 | v1.0 | Nightly `VACUUM INTO` backup | |
+
+### v0.4 auth foundation, built this session
+
+Passkeys (WebAuthn) end to end: usernameless registration and login,
+invite-only via a new `invites` table `03-data-model.md` never originally
+specified (D-019), bearer sessions (30-day TTL, SHA-256-hashed at rest), and
+every existing endpoint now behind `Depends(auth.current_user)` scoped to
+the caller's own id — including two playlist ownership checks
+(`PUT /playlists/{id}/items`, and the `/items` `playlist_id` attach path)
+that had **no check at all** before this pass, v0.3 having shipped with no
+auth yet to check against.
+
+Client: a sign-in/register screen (no username field, ever — the
+authenticator's passkey picker is the whole identity UI), a bearer token
+attached to every request, `/jobs/stream` rewritten from `EventSource` to a
+hand-parsed SSE reader (`EventSource` cannot set an `Authorization` header,
+and a token in the URL would leak into logs), and a `readOnly` flag that a
+401 or a locally-expired session sets — banner shown, library still fully
+usable from IndexedDB, **logout never touches** `items`/`local_media`/OPFS
+(FM-2).
+
+Also fixed in passing: CORS was missing `PATCH`/`PUT` in `allow_methods`
+(latent since v0.3's playlist endpoints landed — never surfaced because dev
+traffic is same-origin through the Vite proxy).
 
 ### v0.3, built this session
 
@@ -185,9 +277,11 @@ is never waiting on OPFS when playback reaches it.
 
 ### Built but knowingly incomplete
 
-- **No migrations.** The schema is `CREATE TABLE IF NOT EXISTS`. Changing a
-  column means deleting `server/pwa-yt.db`. Fine now, not fine once there is
-  data worth keeping — which is the moment v0.4 arrives.
+- **No migrations, still.** The schema is `CREATE TABLE IF NOT EXISTS`.
+  Changing a column means deleting `server/pwa-yt.db` — including now, with
+  real accounts. Deliberately still not built (there is nothing to migrate
+  yet); add it the moment a schema change needs to preserve real user data
+  rather than a personal test library.
 - **Artwork is read from OPFS, not mirrored into IndexedDB.** FM-7 suggests a
   blob store. Both are local so the offline property holds; revisit when a
   sweep has thousands of items to open.
@@ -195,8 +289,20 @@ is never waiting on OPFS when playback reaches it.
   jump to 0.9. See D-017.
 - **`/jobs` is capped at 50 rows.** Fine for one user, wrong the moment a
   library is bigger than the queue view.
-- **No auth anywhere.** Every endpoint acts as `DEV_USER_ID`. Do not put this
-  on a public address.
+- **The client's local catalogue is not namespaced per user.** IndexedDB
+  store `pwa-yt` is one shared set of `items`/`playlists`/`local_media` rows
+  regardless of which account is signed in. Fine for the app's actual usage
+  pattern (one person, one device); a real gap if two different accounts
+  ever sign into the *same* browser profile — they'd see each other's cached
+  local rows even though the server correctly refuses to serve them.
+  Namespacing every store by user id is out of scope for the auth
+  foundation pass; revisit if a shared device ever becomes a real scenario.
+- **`db.DEV_USER_ID` still exists**, seeded on every `db.init()`, and is what
+  `scripts/seed_queue.py` seeds jobs under. It's just a row nothing can log
+  in as any more — no credentials point at it. Harmless as a fixture; any
+  catalogue rows created under it before auth existed are now orphaned
+  (unreachable — nobody can authenticate as `dev@localhost`). Wipe
+  `server/pwa-yt.db` for a clean v0.4 state, same as any other schema change.
 
 ### Deferred shortcuts (`ponytail:` markers in code)
 
@@ -228,6 +334,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-016 | Snapshot `$state` at the structured-clone boundary, not at call sites |
 | D-017 | Job progress travels as a file in scratch, not an IPC queue |
 | D-018 | Playlist position is opaque to the server (client-only fractional indexing); the outbox replays via existing idempotent REST calls, no idempotency-key ledger |
+| D-019 | Usernameless (discoverable-credential) passkeys throughout; an `invites` table 03-data-model.md never specified; WebAuthn ceremonies held in an in-memory dict, not a table |
 
 ---
 
@@ -268,16 +375,24 @@ cd server && uv run uvicorn main:app --port 8000
 cd app && npm install && npm run build && npm run preview -- --port 4173
 ```
 
-Open <http://localhost:4173>. The app proxies `/api` to the server, so it is
-one origin — no CORS, and a tunnel in front works with no configuration.
+Open <http://localhost:4173> — **must be `localhost`, never `127.0.0.1`**,
+now that auth exists (see the fourth trap below). The app proxies `/api` to
+the server, so it is one origin — no CORS, and a tunnel in front works with
+no configuration.
+
+Registration needs an invite code first:
 
 ```bash
-cd server && uv run python test_server.py    # 8 checks
+cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae3ce6f9a1d
+```
+
+```bash
+cd server && uv run python test_server.py    # 13 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```
 
-**Three traps that will cost you an hour each:**
+**Four traps that will cost you an hour each:**
 
 - **The service worker serves the previous shell** until a second load. After
   any rebuild, reload twice before believing what you see. The readiness panel
@@ -288,6 +403,15 @@ cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
   `tarmac` database and unreferenced OPFS media under it. Clear site data for
   the origin once and re-add your tracks; there is no migration and, pre-release
   with a two-track test library, there should not be one.
+- **`127.0.0.1:4173` and `localhost:4173` are different origins** — separate
+  IndexedDB, separate service worker, and as of v0.4, only one of them works
+  at all: WebAuthn's spec rejects an IP address as a valid domain outright
+  (`"127.0.0.1 is an invalid domain"`, straight from the browser, before any
+  server code runs). `PWA_YT_RP_ID` defaults to `localhost` for exactly this
+  reason. A passkey is bound to whichever hostname it was created under for
+  its entire life — through a `cloudflared` tunnel that means a **named**
+  tunnel with a stable hostname, not a quick one that gets a new random
+  hostname every run (D-019).
 
 ---
 
@@ -296,26 +420,35 @@ cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 In the order I would actually do them:
 
 1. **Start the device clock.** Tunnel (`cloudflared tunnel --url
-   http://localhost:4173`), add to the iPhone home screen, download two tracks,
-   force-quit, leave it alone with the device low on free space. Five minutes of
-   work; it starts the only test that cannot be hurried. Still true, still not
-   done — v0.3 was built on top of the same risk position v0.2 was.
-2. **Run the offline protocol** — `02-offline-playback.md` §5, all 14 assertions
-   now that v0.3 exists (9–14 need playlists specifically). The readiness panel
-   reports `persist()`, OPFS `move()`, and the fetch counter directly on screen,
-   so most assertions are readable without a debugger. The two genuinely
-   unknown answers are whether `persist()` returns true and whether Safari
-   supports OPFS `move()`.
-3. ~~Exercise a real playlist import.~~ **Done** — a real 2-track YouTube
+   http://localhost:4173` — a **named** tunnel now, see the fourth trap in §6),
+   add to the iPhone home screen, download two tracks, force-quit, leave it
+   alone with the device low on free space. Five minutes of work; it starts
+   the only test that cannot be hurried. Still true, still not done — every
+   phase since v0.1 was built on top of the same risk position.
+2. **Complete a real passkey registration.** This is the one thing in the auth
+   foundation that needs a human, not more code — open the app on an actual
+   device or desktop Chrome with Windows Hello / Touch ID set up, mint an
+   invite (`uv run python scripts/create_invite.py`), and register. Everything
+   up to the native prompt is verified (§1a); this is the last unverified step,
+   and it unblocks acceptance criterion v0.4-1 (register a second account, confirm
+   neither sees the other's items/jobs).
+3. **Run the offline protocol** — `02-offline-playback.md` §5, all 14 assertions.
+   The readiness panel reports `persist()`, OPFS `move()`, and the fetch
+   counter directly on screen, so most assertions are readable without a
+   debugger. The two genuinely unknown answers are whether `persist()`
+   returns true and whether Safari supports OPFS `move()`. This now also
+   needs step 2 done first, since the library only renders signed in.
+4. **Then the rest of v0.4**, in whatever order matters most: per-user
+   budgets + usage ledger (the `daily_byte_budget` column and `usage_ledger`
+   table already exist, unused), multi-device `/sync`, the encrypted cookie
+   jar, and 429 backoff/circuit-breaker. These were deliberately deferred
+   past the foundation pass, at the owner's explicit choice — not started
+   because nobody got to them yet.
+5. ~~Exercise a real playlist import.~~ **Done** — a real 2-track YouTube
    playlist confirmed the streamed size estimate and full import/download
    path. Still open: a multi-hundred-entry playlist, to see the streaming
    render actually earn its keep and check large-N client cost.
-4. **Before v0.4, add migrations.** Accounts are the point where the database
-   starts holding data that cannot be thrown away. Deliberately not built yet
-   — there is still nothing to migrate, and scaffolding for a migration that
-   doesn't exist is exactly the kind of speculative code this project's
-   working agreement argues against. Build it when v0.4 actually needs it.
-5. ~~Decide whether to cascade-delete `playlist_items`~~ **Done** — deleting a
+6. ~~Decide whether to cascade-delete `playlist_items`~~ **Done** — deleting a
    library item now cascades server-side (same transaction) and client-side
    (`forget()`), pinned by `test_delete_item_cascades_into_playlists`. See
    D-018.
@@ -323,4 +456,4 @@ In the order I would actually do them:
 If step 1 fails — media does not survive on the device — stop and re-read
 `02-offline-playback.md` §2 before writing any more code. That is the scenario
 the phase ordering existed to catch early, and it would still be much cheaper to
-find out now than after v0.4.
+find out now than after the rest of v0.4.

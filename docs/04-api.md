@@ -1,18 +1,29 @@
 # API surface
 
-All endpoints require a bearer token except `/auth/*` and `/health`.
+All endpoints require a bearer token except `/auth/*`, `/health`, and
+`/health/extractors` (the same liveness/monitoring concern as `/health`, and
+it carries no user-specific data).
 All responses are JSON except the artifact download.
 
 ## Auth
 
+Registration and login are both usernameless (resident/discoverable
+credentials) two-step ceremonies. `begin` returns a `ceremony_id` alongside
+the WebAuthn options; `finish` takes that same `ceremony_id` back with the
+browser's response. A ceremony id is single-use and expires after 5 minutes.
+See `08-decisions.md` D-019.
+
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/auth/register/begin` | Requires a valid invite code. Returns WebAuthn creation options. |
-| `POST` | `/auth/register/finish` | Verifies attestation, creates user + credential. |
-| `POST` | `/auth/login/begin` | Returns WebAuthn request options. |
-| `POST` | `/auth/login/finish` | Verifies assertion, returns `{token, expires_at, user}`. |
-| `POST` | `/auth/magic-link` | Fallback and recovery path. Rate-limited hard. |
+| `POST` | `/auth/register/begin` | `{invite_code, email, display_name?}` → `{ceremony_id, options}`. 422 if the invite code is unknown or already used. |
+| `POST` | `/auth/register/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}`. Creates the user + credential and consumes the invite in one transaction. |
+| `POST` | `/auth/login/begin` | No body — usernameless. → `{ceremony_id, options}` with an empty `allowCredentials`, so the authenticator's own picker shows every passkey for this RP. |
+| `POST` | `/auth/login/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}`. |
+| `POST` | `/auth/magic-link` | **Deferred** — not built in the auth foundation pass. Fallback and recovery path, to be rate-limited hard when it lands. |
 | `POST` | `/auth/logout` | Invalidates the session server-side only. |
+
+Invite codes are minted by `server/scripts/create_invite.py`, an operator
+action — there is deliberately no endpoint for it.
 
 **Client rule:** logout clears the token from `meta`. It does **not** clear
 `items`, `local_media`, `artwork`, or OPFS. See `02-offline-playback.md` FM-2.

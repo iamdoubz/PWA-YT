@@ -59,6 +59,16 @@ CREATE TABLE sessions (
   expires_at   TEXT NOT NULL
 );
 
+-- Added in v0.4 build; not in the original design pass. Invite-only
+-- registration (D-008) needs somewhere to actually track codes. See D-019.
+CREATE TABLE invites (
+  code       TEXT PRIMARY KEY,
+  created_by TEXT REFERENCES users(id),              -- NULL for the bootstrap invite
+  used_by    TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  used_at    TEXT
+);
+
 CREATE TABLE sources (                              -- shared cache, not per-user
   source_key    TEXT PRIMARY KEY,                   -- 'youtube:dQw4w9WgXcQ'
   extractor     TEXT NOT NULL,

@@ -17,6 +17,9 @@ const ALLOW = [
   /^https:\/\/svelte\.dev\/e\//, // svelte runtime error codes
   /^https:\/\/bit\.ly\/wb-precache$/, // workbox precache warning
   /^https?:\/\/www\.w3\.org\//, // xml namespaces
+  // @simplewebauthn/browser's console.warn() for the pre-v9 calling
+  // convention, which this app doesn't use (always calls with `{ optionsJSON }`).
+  /^https:\/\/simplewebauthn\.dev\/docs\//,
 ];
 
 const walk = (dir) =>

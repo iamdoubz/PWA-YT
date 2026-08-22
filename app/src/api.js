@@ -19,16 +19,63 @@ class ApiError extends Error {
   }
 }
 
+// Set once at boot from the locally-stored session (never awaited before
+// first paint — the token is read from IndexedDB by App.svelte, not fetched)
+// and again on login/logout. Every request attaches it if present.
+let authToken = null;
+export const setAuthToken = (token) => (authToken = token);
+
+// FM-2: an expired or rejected session degrades to read-only, it does not log
+// out. This is the one place that has to notice a 401 no matter which call
+// site triggered it, so it's a single subscribable callback rather than every
+// call site checking `err.status === 401` itself.
+let onUnauthorized = () => {};
+export const setUnauthorizedHandler = (fn) => (onUnauthorized = fn);
+
+function authHeaders(extra) {
+  const headers = { 'content-type': 'application/json', ...extra };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  return headers;
+}
+
 async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, {
     ...options,
-    headers: { 'content-type': 'application/json', ...options.headers },
+    headers: authHeaders(options.headers),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   const body = res.status === 204 ? null : await res.json().catch(() => null);
+  if (res.status === 401) onUnauthorized();
   if (!res.ok) throw new ApiError(body, res.status);
   return body;
 }
+
+// ----------------------------------------------------------------------- auth
+
+export const registerBegin = (invite_code, email, display_name) =>
+  request('/auth/register/begin', {
+    method: 'POST',
+    body: JSON.stringify({ invite_code, email, display_name }),
+  });
+
+export const registerFinish = (ceremony_id, credential) =>
+  request('/auth/register/finish', {
+    method: 'POST',
+    body: JSON.stringify({ ceremony_id, credential }),
+  });
+
+export const loginBegin = () => request('/auth/login/begin', { method: 'POST' });
+
+export const loginFinish = (ceremony_id, credential) =>
+  request('/auth/login/finish', {
+    method: 'POST',
+    body: JSON.stringify({ ceremony_id, credential }),
+  });
+
+// Best-effort: server-side session invalidation only. The caller owns
+// clearing the local session — and must never clear items/local_media/OPFS
+// alongside it. See FM-2.
+export const logout = () => request('/auth/logout', { method: 'POST' }).catch(() => {});
 
 export const resolveUrl = (url, format_profile) =>
   request('/resolve', { method: 'POST', body: JSON.stringify({ url, format_profile }) });
@@ -55,10 +102,11 @@ export const createItems = (entries, playlist_id) =>
 export async function streamResolve(url, format_profile, { onLine, signal } = {}) {
   const res = await fetch(`${API}/resolve`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ url, format_profile }),
     signal: signal ?? AbortSignal.timeout(120_000),
   });
+  if (res.status === 401) onUnauthorized();
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new ApiError(body, res.status);
@@ -103,42 +151,67 @@ export const listJobs = () => request('/jobs');
 export const retryJob = (id) => request(`/jobs/${id}/retry`, { method: 'POST' });
 
 /**
- * One SSE connection for all in-flight jobs.
+ * One SSE connection for all in-flight jobs, hand-parsed rather than
+ * `EventSource` — `EventSource` cannot set an `Authorization` header, and a
+ * bearer token in the URL as a query param would end up in server logs and
+ * any proxy in front of it. A manual reader can attach the same header every
+ * other request uses.
  *
- * EventSource reconnects on its own, which is usually the point — but offline
- * that means a network request every few seconds forever, and FM-2 is explicit
- * that a library sitting in storage must not depend on the network. So a real
- * failure closes the stream and tells the caller; only the server's own
- * connection cap (which arrives as a `reconnect` event) is reconnected through.
+ * Auto-reconnects only through the server's own connection cap (an
+ * `event: reconnect` line just before it closes the response) — a real
+ * failure closes the stream and tells the caller instead, since FM-2 is
+ * explicit that a library sitting in storage must not depend on the network.
  */
 export function openJobStream(onJobs, onLost) {
-  let source = null;
-  let expected = false;
+  const controller = new AbortController();
   let closed = false;
 
-  const connect = () => {
-    source = new EventSource(`${API}/jobs/stream`);
-    source.onmessage = (e) => onJobs(JSON.parse(e.data));
-    source.addEventListener('reconnect', () => {
-      expected = true;
-    });
-    source.onerror = () => {
-      source.close();
-      if (closed) return;
-      if (expected) {
-        expected = false;
-        connect();
+  async function connect() {
+    let sawReconnect = false;
+    try {
+      const res = await fetch(`${API}/jobs/stream`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      if (res.status === 401) {
+        onUnauthorized();
         return;
       }
-      onLost?.();
-    };
-  };
+      if (!res.ok) throw new Error(`jobs stream failed (${res.status})`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          if (chunk.startsWith('event: reconnect')) {
+            sawReconnect = true;
+            continue;
+          }
+          const dataLine = chunk.split('\n').find((l) => l.startsWith('data: '));
+          if (dataLine) onJobs(JSON.parse(dataLine.slice(6)));
+        }
+      }
+    } catch {
+      if (!closed) onLost?.();
+      return;
+    }
+    if (closed) return;
+    if (sawReconnect) connect();
+    else onLost?.();
+  }
 
   connect();
   return {
     close() {
       closed = true;
-      source?.close();
+      controller.abort();
     },
   };
 }

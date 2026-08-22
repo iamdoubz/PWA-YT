@@ -9,6 +9,7 @@ Nothing here touches the network. Extraction is checked against the live site by
 hitting /resolve; that check becomes the nightly extractor canary in v0.2.
 """
 
+import json
 import os
 import re
 import sys
@@ -147,7 +148,7 @@ def test_delete_item_cascades_into_playlists():
             (playlist_id, item_id, "a0", db.now()),
         )
 
-    main.delete_item(item_id)
+    main.delete_item(item_id, user={"id": db.DEV_USER_ID})
 
     with db.reading() as conn:
         row = conn.execute(
@@ -155,6 +156,124 @@ def test_delete_item_cascades_into_playlists():
             (playlist_id, item_id),
         ).fetchone()
     assert row is not None and row["deleted_at"] is not None, "playlist_items row was not cascaded"
+
+
+def test_session_round_trip_and_expiry():
+    import auth
+
+    with db.writing() as conn:
+        session = auth.create_session(conn, db.DEV_USER_ID, device_label="test")
+
+    user = auth.current_user(authorization=f"Bearer {session['token']}")
+    assert user["id"] == db.DEV_USER_ID
+
+    try:
+        auth.current_user(authorization="Bearer not-a-real-token")
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 401, err
+    else:
+        raise AssertionError("an unknown token should not resolve to a user")
+
+    try:
+        auth.current_user(authorization=None)
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 401, err
+    else:
+        raise AssertionError("a missing Authorization header should 401")
+
+    # Backdate the session past its own expiry — same trick 09-status.md's
+    # reaper test uses — rather than sleeping 30 days.
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE token_hash = ?",
+            (auth._hash_token(session["token"]),),
+        )
+    try:
+        auth.current_user(authorization=f"Bearer {session['token']}")
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 401, err
+    else:
+        raise AssertionError("an expired session should 401, not silently pass")
+
+
+def test_logout_deletes_the_session():
+    import auth
+
+    with db.writing() as conn:
+        session = auth.create_session(conn, db.DEV_USER_ID)
+    auth.delete_session(f"Bearer {session['token']}")
+    try:
+        auth.current_user(authorization=f"Bearer {session['token']}")
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 401, err
+    else:
+        raise AssertionError("logout should invalidate the session server-side")
+
+
+def test_invite_gates_registration():
+    import auth
+
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO invites (code, created_at) VALUES ('nope-not-real-invite', ?)",
+            (db.now(),),
+        )
+        conn.execute(
+            "UPDATE invites SET used_at = ? WHERE code = 'nope-not-real-invite'", (db.now(),)
+        )
+
+    try:
+        auth.begin_registration("a@example.com", "A", "this-code-does-not-exist")
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 422, err
+    else:
+        raise AssertionError("an unknown invite code should be rejected")
+
+    try:
+        auth.begin_registration("a@example.com", "A", "nope-not-real-invite")
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 422, err
+    else:
+        raise AssertionError("an already-used invite code should be rejected")
+
+
+def test_registration_and_login_ceremonies_generate_valid_options():
+    """Exercises the real `webauthn` integration for the half that doesn't
+    need a signature: option generation, ceremony storage, and single-use
+    ceremony ids. The verify_* half (a real passkey signing a real challenge)
+    needs an actual authenticator and is checked by hand in a browser, not
+    here — this file touches no network and no browser, same as extraction.
+    """
+    import auth
+
+    code = db.uuid7()[-12:]
+    with db.writing() as conn:
+        conn.execute("INSERT INTO invites (code, created_at) VALUES (?, ?)", (code, db.now()))
+
+    ceremony_id, options_json = auth.begin_registration("new-user@example.com", "New User", code)
+    options = json.loads(options_json)
+    assert options["rp"]["id"] == auth.RP_ID
+    assert options["authenticatorSelection"]["residentKey"] == "required", (
+        "registration must request a discoverable credential — usernameless "
+        "login depends on it"
+    )
+    assert ceremony_id in auth._ceremonies
+
+    # A ceremony id is single-use even before it's finished successfully.
+    with_bad_credential = {"id": "x", "rawId": "x", "response": {}, "type": "public-key"}
+    try:
+        auth.finish_registration(ceremony_id, with_bad_credential)
+    except Exception:
+        pass  # expected — it's not a real signature
+    assert ceremony_id not in auth._ceremonies, "a finished ceremony must not be replayable"
+
+    login_ceremony_id, login_options_json = auth.begin_login()
+    login_options = json.loads(login_options_json)
+    assert "allowCredentials" not in login_options or not login_options["allowCredentials"], (
+        "login must not restrict to allow_credentials — the passkey picker "
+        "showing every discoverable credential is the whole point"
+    )
+    assert login_ceremony_id != ceremony_id
 
 
 if __name__ == "__main__":

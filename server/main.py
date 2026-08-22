@@ -18,11 +18,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import auth
 import db
 import extract
 import pipeline
@@ -114,10 +115,24 @@ class PlaylistItemsPatch(BaseModel):
     removes: list[str] = []
 
 
+class RegisterBeginRequest(BaseModel):
+    invite_code: str = Field(min_length=1)
+    email: str = Field(min_length=3)
+    display_name: str = ""
+
+
+class CeremonyFinishRequest(BaseModel):
+    ceremony_id: str = Field(min_length=1)
+    credential: dict
+
+
 def error(status: int, code: str, message: str, **extra) -> JSONResponse:
     """Messages are written for the user, not the log. Say what happened and
     what to do about it."""
     return JSONResponse({"error": code, "message": message, **extra}, status_code=status)
+
+
+_ERROR_CODES = {401: "unauthorized", 403: "forbidden", 404: "not_found", 422: "invalid_request"}
 
 
 # ---------------------------------------------------------------- job runner
@@ -337,9 +352,17 @@ app = FastAPI(title="PWA-YT", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "DELETE", "PATCH", "PUT"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(_, exc: HTTPException):
+    """auth.py (and anything else) raises plain HTTPException; this reshapes
+    it into the same {error, message} contract every other endpoint uses,
+    rather than FastAPI's default {"detail": ...}."""
+    return error(exc.status_code, _ERROR_CODES.get(exc.status_code, "error"), str(exc.detail))
 
 
 # ----------------------------------------------------------------- endpoints
@@ -360,6 +383,45 @@ def health_extractors():
     return JSONResponse({"extractors": _canary}, status_code=status)
 
 
+# --------------------------------------------------------------------- auth
+#
+# Usernameless passkeys throughout: registration requires a resident/
+# discoverable credential, and login never sends `allow_credentials`, so the
+# authenticator's own picker is the entire identity UI. See auth.py.
+
+
+@app.post("/auth/register/begin")
+def register_begin(req: RegisterBeginRequest):
+    ceremony_id, options_json = auth.begin_registration(
+        req.email.strip().lower(), req.display_name.strip(), req.invite_code.strip()
+    )
+    return {"ceremony_id": ceremony_id, "options": json.loads(options_json)}
+
+
+@app.post("/auth/register/finish")
+def register_finish(req: CeremonyFinishRequest):
+    return auth.finish_registration(req.ceremony_id, req.credential)
+
+
+@app.post("/auth/login/begin")
+def login_begin():
+    ceremony_id, options_json = auth.begin_login()
+    return {"ceremony_id": ceremony_id, "options": json.loads(options_json)}
+
+
+@app.post("/auth/login/finish")
+def login_finish(req: CeremonyFinishRequest):
+    return auth.finish_login(req.ceremony_id, req.credential)
+
+
+@app.post("/auth/logout")
+def logout(authorization: str | None = Header(default=None)):
+    # Server-side only — see 04-api.md. The client separately never clears
+    # the local catalogue/OPFS on logout; see FM-2.
+    auth.delete_session(authorization)
+    return {"ok": True}
+
+
 def _upsert_source(entry: dict) -> None:
     with db.writing() as conn:
         conn.execute(
@@ -375,17 +437,17 @@ def _upsert_source(entry: dict) -> None:
         )
 
 
-def _already_in_library(source_key: str) -> bool:
+def _already_in_library(user_id: str, source_key: str) -> bool:
     with db.reading() as conn:
         row = conn.execute(
             "SELECT 1 FROM library_items"
             " WHERE user_id = ? AND source_key = ? AND deleted_at IS NULL",
-            (db.DEV_USER_ID, source_key),
+            (user_id, source_key),
         ).fetchone()
     return row is not None
 
 
-def _resolved_entry(entry: dict) -> dict:
+def _resolved_entry(user_id: str, entry: dict) -> dict:
     return {
         "source_key": entry["source_key"],
         "title": entry["title"],
@@ -393,12 +455,12 @@ def _resolved_entry(entry: dict) -> dict:
         "duration_s": entry["duration_s"],
         "thumb_url": entry["thumb_url"],
         "estimated_bytes": entry["estimated_bytes"],
-        "already_in_library": _already_in_library(entry["source_key"]),
+        "already_in_library": _already_in_library(user_id, entry["source_key"]),
     }
 
 
 @app.post("/resolve")
-def resolve(req: ResolveRequest):
+def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
     """Stage 2. Returns a plan, not a job. Nothing is downloaded or enqueued.
 
     Resolving before enqueueing is the difference between a usable import and an
@@ -423,7 +485,7 @@ def resolve(req: ResolveRequest):
 
     if kind == "item":
         _upsert_source(payload)
-        return {"kind": "item", "entry": _resolved_entry(payload)}
+        return {"kind": "item", "entry": _resolved_entry(user["id"], payload)}
 
     def events():
         entries = payload["entries"]
@@ -434,14 +496,14 @@ def resolve(req: ResolveRequest):
         for i, entry in enumerate(entries):
             _upsert_source(entry)
             total += entry["estimated_bytes"] or 0
-            yield json.dumps({"kind": "entry", "index": i, **_resolved_entry(entry)}) + "\n"
+            yield json.dumps({"kind": "entry", "index": i, **_resolved_entry(user["id"], entry)}) + "\n"
         yield json.dumps({"kind": "playlist_done", "total_estimated_bytes": total}) + "\n"
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.post("/items")
-def create_items(req: ItemsRequest):
+def create_items(req: ItemsRequest, user: dict = Depends(auth.current_user)):
     """Stage 3. Creates items and enqueues jobs. Idempotent on (user, source)."""
     created = []
     for entry in req.entries:
@@ -471,17 +533,23 @@ def create_items(req: ItemsRequest):
                            -- request silently reuses the first one's format.
                            format_profile = excluded.format_profile
                    RETURNING id, (added_at != updated_at) AS existed""",
-                (db.uuid7(), db.DEV_USER_ID, entry.source_key, profile, db.now(), db.now()),
+                (db.uuid7(), user["id"], entry.source_key, profile, db.now(), db.now()),
             ).fetchone()
             item_id, existed = row["id"], bool(row["existed"])
 
             job = conn.execute(
                 """INSERT INTO jobs (id, user_id, item_id, state, created_at, updated_at)
                    VALUES (?, ?, ?, 'queued', ?, ?) RETURNING id""",
-                (db.uuid7(), db.DEV_USER_ID, item_id, db.now(), db.now()),
+                (db.uuid7(), user["id"], item_id, db.now(), db.now()),
             ).fetchone()
 
             if req.playlist_id and entry.position:
+                owns = conn.execute(
+                    "SELECT 1 FROM playlists WHERE id=? AND user_id=?",
+                    (req.playlist_id, user["id"]),
+                ).fetchone()
+                if not owns:
+                    raise HTTPException(404, "No such playlist.")
                 conn.execute(
                     """INSERT INTO playlist_items (playlist_id, item_id, position, updated_at, deleted_at)
                        VALUES (?, ?, ?, ?, NULL)
@@ -502,7 +570,7 @@ def create_items(req: ItemsRequest):
 
 
 @app.get("/items")
-def list_items():
+def list_items(user: dict = Depends(auth.current_user)):
     with db.reading() as conn:
         rows = conn.execute(
             """SELECT i.id, i.source_key, i.format_profile, i.added_at,
@@ -510,7 +578,7 @@ def list_items():
                  FROM library_items i JOIN sources s ON s.source_key = i.source_key
                 WHERE i.user_id = ? AND i.deleted_at IS NULL
                 ORDER BY i.added_at DESC""",
-            (db.DEV_USER_ID,),
+            (user["id"],),
         ).fetchall()
     return {
         "items": [
@@ -520,14 +588,14 @@ def list_items():
 
 
 @app.delete("/items/{item_id}")
-def delete_item(item_id: str):
+def delete_item(item_id: str, user: dict = Depends(auth.current_user)):
     # Cascades into every playlist that held this item, in the same
     # transaction — otherwise a deleted item keeps a dangling playlist_items
     # row that only the UI's join hides. See D-018.
     with db.writing() as conn:
         conn.execute(
             "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
-            (db.now(), db.now(), item_id, db.DEV_USER_ID),
+            (db.now(), db.now(), item_id, user["id"]),
         )
         conn.execute(
             "UPDATE playlist_items SET deleted_at=?, updated_at=?"
@@ -547,27 +615,30 @@ def delete_item(item_id: str):
 
 
 @app.post("/playlists")
-def create_playlist(req: PlaylistCreate):
+def create_playlist(req: PlaylistCreate, user: dict = Depends(auth.current_user)):
     with db.writing() as conn:
         conn.execute(
             """INSERT INTO playlists (id, user_id, name, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(id) DO NOTHING""",
-            (req.id, db.DEV_USER_ID, req.name, db.now(), db.now()),
+            (req.id, user["id"], req.name, db.now(), db.now()),
         )
     return {"ok": True, "id": req.id}
 
 
 @app.get("/playlists")
-def list_playlists():
+def list_playlists(user: dict = Depends(auth.current_user)):
     with db.reading() as conn:
         playlists = conn.execute(
             "SELECT * FROM playlists WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at",
-            (db.DEV_USER_ID,),
+            (user["id"],),
         ).fetchall()
         pl_items = conn.execute(
-            """SELECT playlist_id, item_id, position FROM playlist_items
-                WHERE deleted_at IS NULL ORDER BY playlist_id, position"""
+            """SELECT pi.playlist_id, pi.item_id, pi.position
+                 FROM playlist_items pi JOIN playlists p ON p.id = pi.playlist_id
+                WHERE p.user_id = ? AND pi.deleted_at IS NULL
+                ORDER BY pi.playlist_id, pi.position""",
+            (user["id"],),
         ).fetchall()
     by_playlist: dict[str, list] = {}
     for row in pl_items:
@@ -581,33 +652,45 @@ def list_playlists():
     }
 
 
+def _own_playlist(conn, playlist_id: str, user_id: str) -> None:
+    if not conn.execute(
+        "SELECT 1 FROM playlists WHERE id=? AND user_id=? AND deleted_at IS NULL",
+        (playlist_id, user_id),
+    ).fetchone():
+        raise HTTPException(404, "No such playlist.")
+
+
 @app.patch("/playlists/{playlist_id}")
-def rename_playlist(playlist_id: str, req: PlaylistRename):
+def rename_playlist(playlist_id: str, req: PlaylistRename, user: dict = Depends(auth.current_user)):
     with db.writing() as conn:
+        _own_playlist(conn, playlist_id, user["id"])
         conn.execute(
             "UPDATE playlists SET name=?, updated_at=? WHERE id=? AND user_id=?",
-            (req.name, db.now(), playlist_id, db.DEV_USER_ID),
+            (req.name, db.now(), playlist_id, user["id"]),
         )
     return {"ok": True}
 
 
 @app.delete("/playlists/{playlist_id}")
-def delete_playlist(playlist_id: str):
+def delete_playlist(playlist_id: str, user: dict = Depends(auth.current_user)):
     with db.writing() as conn:
         conn.execute(
             "UPDATE playlists SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
-            (db.now(), db.now(), playlist_id, db.DEV_USER_ID),
+            (db.now(), db.now(), playlist_id, user["id"]),
         )
     return {"ok": True}
 
 
 @app.put("/playlists/{playlist_id}/items")
-def patch_playlist_items(playlist_id: str, req: PlaylistItemsPatch):
+def patch_playlist_items(
+    playlist_id: str, req: PlaylistItemsPatch, user: dict = Depends(auth.current_user)
+):
     """Full ordered replacement (many upserts) or a single-move patch (one
     upsert) — same endpoint, see 04-api.md. A reorder writes exactly the rows
     that moved, never the whole list, which is what keeps a 200-track offline
     reorder to one outbox row per move rather than a renumbered tail."""
     with db.writing() as conn:
+        _own_playlist(conn, playlist_id, user["id"])
         for u in req.upserts:
             conn.execute(
                 """INSERT INTO playlist_items (playlist_id, item_id, position, updated_at, deleted_at)
@@ -646,20 +729,20 @@ def _job_json(row) -> dict:
 
 
 @app.get("/jobs")
-def list_jobs():
+def list_jobs(user: dict = Depends(auth.current_user)):
     # The client uses /jobs/stream, not this. Kept because it is the documented
     # contract in 04-api.md and it is what you reach for with curl when the
     # stream is misbehaving.
     with db.reading() as conn:
         rows = conn.execute(
             "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
-            (db.DEV_USER_ID,),
+            (user["id"],),
         ).fetchall()
     return {"jobs": [_job_json(r) for r in rows]}
 
 
 @app.get("/jobs/stream")
-def stream_jobs():
+def stream_jobs(user: dict = Depends(auth.current_user)):
     """One SSE connection for all in-flight jobs.
 
     Not WebSockets: progress is one-directional, SSE reconnects on its own, and
@@ -667,6 +750,7 @@ def stream_jobs():
     babysit. Connections are capped so a client that wanders off does not hold
     a threadpool worker forever — EventSource reconnects by itself.
     """
+    user_id = user["id"]  # captured now — `Depends` doesn't re-run inside the generator
 
     def events():
         last = None
@@ -675,7 +759,7 @@ def stream_jobs():
             with db.reading() as conn:
                 rows = conn.execute(
                     "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
-                    (db.DEV_USER_ID,),
+                    (user_id,),
                 ).fetchall()
             payload = json.dumps({"jobs": [_job_json(r) for r in rows]})
             if payload != last:
@@ -692,14 +776,14 @@ def stream_jobs():
 
 
 @app.get("/jobs/{job_id}/artifact/{filename}")
-def get_artifact(job_id: str, filename: str, token: str = ""):
+def get_artifact(job_id: str, filename: str, token: str = "", user: dict = Depends(auth.current_user)):
     """Signed, short-TTL, resumable. Starlette handles Range on FileResponse."""
     if filename not in {"audio.m4a", "audio.mp3", "video.mp4", "art.jpg", "art-sq.jpg"}:
         return error(404, "not_found", "No such artifact file.")
 
     with db.reading() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ? AND user_id = ?",
-                           (job_id, db.DEV_USER_ID)).fetchone()
+                           (job_id, user["id"])).fetchone()
     if row is None or not row["artifact_path"] or not row["artifact_token"]:
         return error(404, "not_found", "That artifact is gone. Retry the job to rebuild it.")
     if not secrets.compare_digest(token, row["artifact_token"]):
@@ -720,12 +804,12 @@ def get_artifact(job_id: str, filename: str, token: str = ""):
 
 
 @app.delete("/jobs/{job_id}/artifact")
-def collect_artifact(job_id: str):
+def collect_artifact(job_id: str, user: dict = Depends(auth.current_user)):
     """The collection acknowledgement — the contract that keeps the server
     stateless. Scratch is deleted immediately."""
     with db.reading() as conn:
         row = conn.execute("SELECT artifact_path FROM jobs WHERE id = ? AND user_id = ?",
-                           (job_id, db.DEV_USER_ID)).fetchone()
+                           (job_id, user["id"])).fetchone()
     if row is None:
         return error(404, "not_found", "No such job.")
     if row["artifact_path"]:
@@ -740,11 +824,11 @@ def collect_artifact(job_id: str):
 
 
 @app.post("/jobs/{job_id}/retry")
-def retry_job(job_id: str):
+def retry_job(job_id: str, user: dict = Depends(auth.current_user)):
     with db.writing() as conn:
         conn.execute(
             "UPDATE jobs SET state='queued', error=NULL, progress=0, updated_at=?"
             " WHERE id=? AND user_id=? AND state IN ('failed','expired')",
-            (db.now(), job_id, db.DEV_USER_ID),
+            (db.now(), job_id, user["id"]),
         )
     return {"ok": True}

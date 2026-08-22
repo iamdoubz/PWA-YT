@@ -448,3 +448,69 @@ Pinned by `test_delete_item_cascades_into_playlists`.
 the moment a mutation kind is *not* naturally idempotent — at that point add
 one for that kind specifically, rather than retrofitting a ledger everything
 has to carry.
+
+---
+
+## D-019 · Usernameless passkeys, an `invites` table, and in-memory ceremonies
+
+**Status:** accepted · 2026-08-22 · v0.4 (auth foundation)
+
+**Context.** D-008 decided passkeys, multi-user, invite-only. Making that
+real required filling in specifics the original design pass left open.
+
+**Decision 1 — usernameless (discoverable/resident) credentials throughout.**
+Registration requests `resident_key=REQUIRED`; login sends no
+`allow_credentials` at all. The authenticator's own passkey picker is the
+entire identity UI — there is no username field anywhere in the client. This
+is friendlier than username-first WebAuthn and costs nothing extra to
+implement; the alternative (asking for an email/username before every login)
+is strictly more UI for no security benefit once passkeys are the only factor.
+
+**Decision 2 — an `invites` table that 03-data-model.md never specified.**
+`03-data-model.md` only ever had `users.invited_by`, which records *who*
+invited someone after the fact but gives registration nothing to check
+*before* creating an account. Added `invites(code, created_by, used_by,
+created_at, used_at)` — single-use, no expiry (an operator revoking access is
+"disable the user," not "invite codes rot"). Minting one is a script
+(`scripts/create_invite.py`), not an endpoint — invites are the operator's
+action, not a thing users request from within the app.
+
+**Decision 3 — WebAuthn ceremonies live in an in-memory dict, not a table.**
+Registration and login are two-step: `begin` generates a challenge the
+browser must sign and `finish` verifies the signature against it. That
+challenge has to be held somewhere between the two calls. A `pending_
+ceremonies` table would need its own reaper, its own index, and would still
+only ever hold rows with a 5-minute lifetime. This app is one process (the
+FastAPI layer, not the resolve/job pools), so a `dict` behind a `Lock`,
+swept opportunistically on each new ceremony, does the same job with no
+schema and nothing to leak across a restart worth caring about — a dropped
+ceremony mid-restart is just "try signing in again," identically to what a
+5-minute TTL already produces on its own.
+
+**Decision 4 — library: `webauthn` (py_webauthn) server-side,
+`@simplewebauthn/browser` client-side.** Same spec, same JSON encoding
+conventions (SimpleWebAuthn's ecosystem is why these two interoperate without
+either side hand-rolling base64url⇄ArrayBuffer conversions) — exactly the
+kind of subtle binary-encoding logic worth a real dependency rather than
+reimplementing, on both ends. Client output (`RegistrationResponseJSON` /
+`AuthenticationResponseJSON`) is accepted by the server's `verify_*_response`
+as a plain dict with zero translation in between.
+
+**Decision 5 — `expected_origin` reuses `PWA_YT_ORIGINS`, but rejects `*`.**
+CORS tolerates a wildcard; WebAuthn has no such concept — an origin is exact
+or it isn't accepted. `auth.py` reads the same env var main.py's CORS
+middleware does and filters out `*`, falling back to
+`http://localhost:4173` if nothing concrete is configured. `PWA_YT_RP_ID`
+is separate (a bare hostname, no scheme/port) and defaults to `localhost`.
+
+**Consequence to remember when testing through a tunnel.** A passkey is
+bound to `RP_ID` for its entire life. A `cloudflared` quick tunnel gets a new
+random hostname every run, which would silently orphan every passkey
+registered through the previous one. Testing on a phone through a tunnel
+needs a stable hostname (a named tunnel, not a quick one) for this reason —
+unrelated to, but just as real as, the existing tunnel requirement for OPFS/
+service-worker HTTPS.
+
+**What would change this.** Nothing about the resident-key or ceremony-
+storage decisions. The origin/RP_ID story gets revisited if this ever runs
+behind a fixed production domain instead of a dev tunnel.

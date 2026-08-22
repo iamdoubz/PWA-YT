@@ -35,6 +35,36 @@ CREATE TABLE IF NOT EXISTS users (
   disabled_at       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS credentials (
+  id           TEXT PRIMARY KEY,        -- credential id, base64url
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_key   BLOB NOT NULL,
+  sign_count   INTEGER NOT NULL DEFAULT 0,
+  transports   TEXT,
+  created_at   TEXT NOT NULL,
+  last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash   TEXT PRIMARY KEY,        -- SHA-256 of the bearer token; the
+                                         -- raw token is never stored
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_label TEXT,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
+
+-- Not in 03-data-model.md's original schema — invite-only registration needed
+-- somewhere to actually track codes. See D-019.
+CREATE TABLE IF NOT EXISTS invites (
+  code       TEXT PRIMARY KEY,
+  created_by TEXT REFERENCES users(id),
+  used_by    TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  used_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS sources (
   source_key    TEXT PRIMARY KEY,
   extractor     TEXT NOT NULL,
@@ -115,10 +145,6 @@ CREATE TABLE IF NOT EXISTS playlist_items (
 );
 CREATE INDEX IF NOT EXISTS ix_pli_order ON playlist_items(playlist_id, position);
 """
-
-# credentials / sessions are in 03-data-model.md but land with v0.4 (accounts).
-# Creating tables nothing reads is how a schema starts lying about what the app
-# does.
 
 _writer: sqlite3.Connection | None = None
 _write_lock = threading.Lock()
