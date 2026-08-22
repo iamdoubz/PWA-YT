@@ -521,10 +521,18 @@ def list_items():
 
 @app.delete("/items/{item_id}")
 def delete_item(item_id: str):
+    # Cascades into every playlist that held this item, in the same
+    # transaction — otherwise a deleted item keeps a dangling playlist_items
+    # row that only the UI's join hides. See D-018.
     with db.writing() as conn:
         conn.execute(
             "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
             (db.now(), db.now(), item_id, db.DEV_USER_ID),
+        )
+        conn.execute(
+            "UPDATE playlist_items SET deleted_at=?, updated_at=?"
+            " WHERE item_id=? AND deleted_at IS NULL",
+            (db.now(), db.now(), item_id),
         )
     return {"ok": True}
 

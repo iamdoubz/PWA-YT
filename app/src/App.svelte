@@ -596,6 +596,23 @@
     await db.remove('items', item.id);
     delete media[item.id];
     items = items.filter((i) => i.id !== item.id);
+
+    // Cascades locally too, mirroring what the server does in the same
+    // transaction when this replays — otherwise the local playlist_items row
+    // just sits there forever with nothing to ever clean it up. See D-018.
+    const stamp = new Date().toISOString();
+    const next = [];
+    for (const pi of playlistItems) {
+      if (pi.item_id === item.id && !pi.deleted_at) {
+        const row = { ...pi, deleted_at: stamp, updated_at: stamp };
+        await db.put('playlist_items', row);
+        next.push(row);
+      } else {
+        next.push(pi);
+      }
+    }
+    playlistItems = next;
+
     refreshStorage();
     await mutate('item_delete', { id: item.id }, () => api.deleteItem(item.id));
   }

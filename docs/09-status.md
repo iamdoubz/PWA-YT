@@ -111,13 +111,23 @@ All seven stages run. Evidence from real runs, not assertion:
 | v0.2 | 3 · fifty queued items, UI not blocked | pass, **with a caveat** |
 | v0.2 | 4 · no `.part` masquerading as complete | pass |
 | v0.3 | 1 · assertions 9–14 of the offline test protocol | **NOT RUN on device** — see below |
-| v0.3 | 2 · 400-entry playlist streams with a running size estimate | not yet exercised against a real 400-entry playlist; the NDJSON parser is verified end-to-end for the single-item (one-line) case and the server-side flat-enumeration branch is verified with a mocked yt-dlp response |
+| v0.3 | 2 · playlist streams with a running size estimate | pass, **with a caveat** — real 2-track playlist, not 400 entries |
 | v0.3 | 3 · 200-track offline reorder, one outbox row per move, replays after 4h | **mechanism** verified (create/rename/delete a playlist and delete an item while the server was down, then reconnected — outbox drained in order, server state matched); reorder specifically and the 4-hour/200-track scale were not exercised |
 
 Criterion 3's caveat (v0.2): the 50 items were **synthetic artifacts** seeded
 by `server/scripts/seed_queue.py`, not fifty real fetches. It measured the
 client queue (51 items drained, zero long tasks over 50 ms). **The server has
 never been run at fifty concurrent real jobs.**
+
+Criterion 2's caveat (v0.3): a real YouTube playlist (`list=PLLCoMbyL17pY`,
+titled "Kids") went through `/resolve` end to end — streamed
+`playlist_head`/`entry`/`playlist_done`, rendered "2 tracks found", a running
+"~11.4 MB (estimate)" that recalculated to "~5.7 MB" on deselecting one entry
+(both figures match `duration_s × bitrate ÷ 8` by hand), then imported,
+downloaded, and played both tracks correctly. What it does *not* cover: a
+playlist anywhere near 400 entries, so the streaming-render benefit (seeing
+entries before the last one arrives) and any large-N client rendering cost are
+still unverified.
 
 v0.3 was smoke-tested in a desktop Chrome browser only: create playlist →
 resolve → download → add to playlist → play from playlist → reorder buttons
@@ -126,6 +136,13 @@ item offline → restart the server → reload → outbox drained and the server
 confirmed the mutations landed. That is the desktop analogue of the plane
 test the same way v0.2's "both origins killed" check was — **not** a
 substitute for the real device protocol, which has still never been run (§1).
+
+One thing this run found that wasn't a code bug: the dev server process died
+mid-session with no traceback (looks like the sandbox reaping a long-lived
+background process, not an application crash — confirmed by restarting it and
+replaying the same requests successfully). Worth knowing as noise if it
+happens again while testing this way; not evidence of anything wrong in
+`main.py`.
 
 ### Verified with both origins killed
 
@@ -180,10 +197,6 @@ is never waiting on OPFS when playback reaches it.
   library is bigger than the queue view.
 - **No auth anywhere.** Every endpoint acts as `DEV_USER_ID`. Do not put this
   on a public address.
-- **Deleting a library item doesn't cascade into playlists.** The
-  `playlist_items` row referencing it is left in place, both client and
-  server side — the UI hides it via a join against the live `items` mirror, so
-  nothing looks broken, but the rows accumulate. See D-018.
 
 ### Deferred shortcuts (`ponytail:` markers in code)
 
@@ -293,14 +306,19 @@ In the order I would actually do them:
    so most assertions are readable without a debugger. The two genuinely
    unknown answers are whether `persist()` returns true and whether Safari
    supports OPFS `move()`.
-3. **Exercise a real playlist import.** Everything in v0.3 was checked against
-   a single downloaded track and mocked server responses; a real multi-hundred-
-   entry YouTube playlist has not gone through `/resolve` yet. That's the
-   remaining unknown in acceptance criterion v0.3-2.
+3. ~~Exercise a real playlist import.~~ **Done** — a real 2-track YouTube
+   playlist confirmed the streamed size estimate and full import/download
+   path. Still open: a multi-hundred-entry playlist, to see the streaming
+   render actually earn its keep and check large-N client cost.
 4. **Before v0.4, add migrations.** Accounts are the point where the database
-   starts holding data that cannot be thrown away.
-5. **Decide whether to cascade-delete `playlist_items`** when a library item
-   is deleted (see D-018's known gap) before it accumulates in a real library.
+   starts holding data that cannot be thrown away. Deliberately not built yet
+   — there is still nothing to migrate, and scaffolding for a migration that
+   doesn't exist is exactly the kind of speculative code this project's
+   working agreement argues against. Build it when v0.4 actually needs it.
+5. ~~Decide whether to cascade-delete `playlist_items`~~ **Done** — deleting a
+   library item now cascades server-side (same transaction) and client-side
+   (`forget()`), pinned by `test_delete_item_cascades_into_playlists`. See
+   D-018.
 
 If step 1 fails — media does not survive on the device — stop and re-read
 `02-offline-playback.md` §2 before writing any more code. That is the scenario

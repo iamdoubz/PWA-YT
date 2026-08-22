@@ -438,12 +438,11 @@ devices reordering the same playlist offline and reconciling via `updated_at`
 — is still v0.4's `/sync` pull, not this. The outbox only replays this
 device's own queued mutations in order; it does not pull anyone else's.
 
-**Known gap.** Deleting a library item does not cascade into the playlists
-that contain it — `playlist_items` rows referencing a deleted item are left in
-place (the UI hides them via a join against the live `items` mirror, so
-nothing broken is visible, but the rows accumulate server-side). Revisit if a
-library sees enough delete/re-add churn for this to matter; `03-data-model.md`
-doesn't specify cascade behavior here either.
+**Known gap, closed.** Deleting a library item now cascades into every
+playlist that held it — `DELETE /items/{id}` soft-deletes the matching
+`playlist_items` rows in the same transaction, and `forget()` mirrors that
+locally so the tombstone exists offline too, not just after a round trip.
+Pinned by `test_delete_item_cascades_into_playlists`.
 
 **What would change this.** The idempotency-ledger approach becomes necessary
 the moment a mutation kind is *not* naturally idempotent — at that point add

@@ -122,6 +122,41 @@ def test_prefer_copy_never_upscales_a_bitrate():
     assert pipeline.should_copy({**aac, "audio_codec": "mp3"}, "mp4a.40.2", 129.5) is False
 
 
+def test_delete_item_cascades_into_playlists():
+    import main
+
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING",
+            ("youtube:cascade-test", "youtube", "cascade-test", "http://x", db.now()),
+        )
+        item_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO library_items (id, user_id, source_key, format_profile, added_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (item_id, db.DEV_USER_ID, "youtube:cascade-test", "{}", db.now(), db.now()),
+        )
+        playlist_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (playlist_id, db.DEV_USER_ID, "Cascade Test", db.now(), db.now()),
+        )
+        conn.execute(
+            "INSERT INTO playlist_items (playlist_id, item_id, position, updated_at) VALUES (?,?,?,?)",
+            (playlist_id, item_id, "a0", db.now()),
+        )
+
+    main.delete_item(item_id)
+
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT deleted_at FROM playlist_items WHERE playlist_id=? AND item_id=?",
+            (playlist_id, item_id),
+        ).fetchone()
+    assert row is not None and row["deleted_at"] is not None, "playlist_items row was not cascaded"
+
+
 if __name__ == "__main__":
     db.init()  # schema must exist before any test that touches it
     failures = 0
