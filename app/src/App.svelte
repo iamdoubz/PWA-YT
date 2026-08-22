@@ -7,6 +7,7 @@
   import { API } from './api.js';
   import { net } from './net.svelte.js';
   import * as outbox from './outbox.js';
+  import * as sync from './sync.js';
   import { uuid7 } from './id.js';
 
   const ACTIVE = ['queued', 'fetching', 'transforming', 'ready'];
@@ -75,6 +76,14 @@
   let inviteCode = $state('');
   let authEmail = $state('');
   let authDisplayName = $state('');
+
+  // Account settings — loaded lazily after first paint, same as everything
+  // else that needs a network round trip. FM-2.
+  let usage = $state(null); // { bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs } | null
+  let cookiesInfo = $state(null); // { configured, updated_at } | null
+  let cookiesText = $state('');
+  let cookiesBusy = $state(false);
+  let cookiesMessage = $state(null);
 
   let audio; // ONE element for the app's lifetime. FM-5: a fresh element per
   // track loses the iOS gesture unlock and playback dies once backgrounded.
@@ -178,18 +187,57 @@
     queueMicrotask(() => {
       startPolling();
       runSweep();
-      outbox.drainOnce();
+      reconcile();
+      refreshAccountInfo();
     });
 
-    // The other trigger for draining queued offline mutations — reconnect can
-    // happen with the app already open and idle, not just at boot.
-    window.addEventListener('online', () => outbox.drainOnce());
+    // The other trigger for reconciling — reconnect can happen with the app
+    // already open and idle, not just at boot.
+    window.addEventListener('online', reconcile);
   });
 
   async function refreshStorage() {
     if (!navigator.storage?.estimate) return;
     const { usage, quota } = await navigator.storage.estimate();
     storage = { usage, quota };
+  }
+
+  // ------------------------------------------------------------------- sync
+  //
+  // Pull half of multi-device convergence (sync.js). A remote tombstone for
+  // an item only removes IndexedDB rows there — purging the actual OPFS
+  // bytes and any in-memory object URLs is a side effect only this component
+  // can do, so it's passed in as a callback rather than living in sync.js.
+
+  async function purgeLocalMedia(itemId) {
+    for (const url of Object.values(urls[itemId] ?? {})) URL.revokeObjectURL(url);
+    delete urls[itemId];
+    if (playingId === itemId) stop();
+    if (media[itemId]) worker.postMessage({ type: 'purge', itemId });
+    await db.remove('local_media', itemId);
+    delete media[itemId];
+  }
+
+  async function refreshCatalogueFromLocal() {
+    const [catalogue, pls, plItems] = await Promise.all([
+      db.all('items'),
+      db.all('playlists'),
+      db.all('playlist_items'),
+    ]);
+    items = catalogue.sort((a, b) => b.added_at.localeCompare(a.added_at));
+    playlists = pls;
+    playlistItems = plItems;
+  }
+
+  // The one place both halves of reconnect run together: push this device's
+  // queued mutations, then pull whatever changed on another device signed
+  // into the same account, then reflect both in the reactive state that
+  // sync.js and outbox.js — plain modules, no Svelte runes — can't touch
+  // directly.
+  async function reconcile() {
+    await outbox.drainOnce();
+    await sync.pullOnce(purgeLocalMedia);
+    await refreshCatalogueFromLocal();
   }
 
   // ------------------------------------------------------------------- auth
@@ -207,6 +255,52 @@
     readOnly = false;
     authError = null;
     startPolling();
+    refreshAccountInfo();
+  }
+
+  async function refreshAccountInfo() {
+    if (!session) return;
+    // Both best-effort and independent — one failing (e.g. offline) must not
+    // hide the other.
+    try {
+      usage = await api.meUsage();
+    } catch {
+      /* shown as '…' below; not worth a banner over */
+    }
+    try {
+      cookiesInfo = await api.cookiesStatus();
+    } catch {
+      /* same */
+    }
+  }
+
+  async function saveCookies() {
+    if (!cookiesText.trim()) return;
+    cookiesBusy = true;
+    cookiesMessage = null;
+    try {
+      await api.putCookies(cookiesText);
+      cookiesText = '';
+      cookiesInfo = await api.cookiesStatus();
+      cookiesMessage = 'Saved.';
+    } catch (err) {
+      cookiesMessage = err.message;
+    } finally {
+      cookiesBusy = false;
+    }
+  }
+
+  async function clearCookies() {
+    cookiesBusy = true;
+    cookiesMessage = null;
+    try {
+      await api.deleteCookies();
+      cookiesInfo = await api.cookiesStatus();
+    } catch (err) {
+      cookiesMessage = err.message;
+    } finally {
+      cookiesBusy = false;
+    }
   }
 
   async function doRegister() {
@@ -484,7 +578,12 @@
   function applyJobs(data) {
     lastSync = new Date().toISOString();
     db.setMeta('last_sync', lastSync);
-    outbox.drainOnce(); // a live jobs stream is proof we're online right now
+    // Not the full reconcile() here — this fires up to once a second while
+    // any job is active, and a /sync round trip that often is chatter for no
+    // benefit. drainOnce() alone is cheap (no network call at all when the
+    // outbox is empty, the common case) and boot + reconnect already cover
+    // pulling in whatever changed on another device.
+    outbox.drainOnce();
 
     let busy = false;
     for (const job of data.jobs) {
@@ -889,6 +988,48 @@
       <span class="dim">{session.user.display_name || session.user.email}</span>
       <button class="ghost" onclick={doLogout}>Sign out</button>
     </div>
+
+    <details class="format">
+      <summary class="dim">
+        Account
+        {#if usage}
+          · {gb(usage.bytes_used_today)} of {gb(usage.daily_byte_budget)} used today
+        {/if}
+      </summary>
+      <p class="dim">
+        {#if usage}
+          {usage.active_jobs} active job{usage.active_jobs === 1 ? '' : 's'} ·
+          {gb(usage.remaining_bytes)} left today
+        {:else}
+          Usage — …
+        {/if}
+      </p>
+      <p class="dim">
+        Cookies for private or age-restricted content
+        {#if cookiesInfo?.configured}
+          — configured {when(cookiesInfo.updated_at)}
+        {:else if cookiesInfo}
+          — not configured
+        {/if}
+        . Exported from a browser extension, Netscape format. Stored
+        encrypted; never shown back once saved.
+      </p>
+      <textarea
+        rows="3"
+        placeholder="Paste a cookies.txt export here"
+        bind:value={cookiesText}
+        aria-label="Cookies"
+      ></textarea>
+      <div class="row">
+        <button onclick={saveCookies} disabled={cookiesBusy || !cookiesText.trim()}>
+          {cookiesBusy ? 'Saving…' : 'Save cookies'}
+        </button>
+        {#if cookiesInfo?.configured}
+          <button class="ghost" onclick={clearCookies} disabled={cookiesBusy}>Clear</button>
+        {/if}
+      </div>
+      {#if cookiesMessage}<p class="dim">{cookiesMessage}</p>{/if}
+    </details>
 
   <form
     class="add"
@@ -1469,6 +1610,18 @@
     border-radius: 6px;
     background: #0b0b0c;
     color: inherit;
+  }
+  .format textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+    border: 1px solid #33333a;
+    border-radius: 6px;
+    background: #16161a;
+    color: inherit;
+    resize: vertical;
   }
   .row.account {
     justify-content: space-between;

@@ -8,4 +8,5 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "yt-dlp>=2026.8.19",
     "webauthn>=3.0",
+    "cryptography>=42",
 ]

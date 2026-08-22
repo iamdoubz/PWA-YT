@@ -4,6 +4,7 @@ Endpoints are sync `def`, so FastAPI runs them in its threadpool and blocking
 SQLite calls never touch the event loop.
 """
 
+import base64
 import json
 import os
 import random
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -60,6 +62,23 @@ ORIGINS = os.environ.get("PWA_YT_ORIGINS", "*").split(",")
 _resolve_pool: ProcessPoolExecutor | None = None
 _job_pool: ProcessPoolExecutor | None = None
 _stop = threading.Event()
+
+# The per-user cookie jar (private/age-gated content) is encrypted at rest
+# with this key. Set PWA_YT_COOKIE_KEY explicitly in any deployment that must
+# survive a restart — an auto-generated key here is session-only, and cookies
+# saved under a since-discarded key just decrypt as "not configured" rather
+# than crashing anything (see _user_cookies below).
+_COOKIE_KEY_ENV = "PWA_YT_COOKIE_KEY"
+_cookie_key = os.environ.get(_COOKIE_KEY_ENV)
+if not _cookie_key:
+    _cookie_key = Fernet.generate_key().decode()
+    print(
+        f"[cookies] {_COOKIE_KEY_ENV} not set — generated a session-only key.\n"
+        f"          Cookies saved now will stop decrypting after a restart unless\n"
+        f"          you set {_COOKIE_KEY_ENV}={_cookie_key} and keep it.",
+        flush=True,
+    )
+_fernet = Fernet(_cookie_key.encode())
 
 
 class FormatProfile(BaseModel):
@@ -163,12 +182,51 @@ def _claim() -> dict | None:
     return dict(row) if row else None
 
 
-def _finish(job_id: str, result: dict, scratch_dir: Path) -> None:
+def _record_usage(user_id: str, num_bytes: int) -> None:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with db.writing() as conn:
+        conn.execute(
+            """INSERT INTO usage_ledger (user_id, day, bytes) VALUES (?, ?, ?)
+               ON CONFLICT(user_id, day) DO UPDATE SET bytes = bytes + excluded.bytes""",
+            (user_id, day, num_bytes),
+        )
+
+
+def _usage_today(user_id: str) -> int:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT bytes FROM usage_ledger WHERE user_id = ? AND day = ?", (user_id, day)
+        ).fetchone()
+    return row["bytes"] if row else 0
+
+
+def _user_cookies(user_id: str) -> str | None:
+    """Decrypted only for the lifetime of one resolve/download call — never
+    written anywhere except a job's own scratch dir (pipeline.py) or a temp
+    file cleaned up immediately after (extract.py). A decrypt failure (key
+    rotated since these were saved) is treated as "no cookies configured"
+    rather than raised — a resolve or download that doesn't need private
+    content must not fail because of one that's now unreadable."""
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT cookies_encrypted FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    if not row or not row["cookies_encrypted"]:
+        return None
+    try:
+        return _fernet.decrypt(bytes(row["cookies_encrypted"])).decode()
+    except InvalidToken:
+        return None
+
+
+def _finish(job_id: str, result: dict, scratch_dir: Path, user_id: str) -> None:
     # By name prefix, not an exact "audio.m4a": an MP3 profile emits audio.mp3,
     # and the exact-match version raised StopIteration on the first one.
     audio = next(
         (f for f in result["files"] if f["name"].startswith("audio")), result["files"][0]
     )
+    total_bytes = sum(f["bytes"] for f in result["files"])
     token = secrets.token_urlsafe(32)
     expires = (datetime.now(timezone.utc) + timedelta(seconds=ARTIFACT_TTL_S)).isoformat(
         timespec="milliseconds"
@@ -183,7 +241,7 @@ def _finish(job_id: str, result: dict, scratch_dir: Path) -> None:
             (
                 "copied" if result["copied"] else "transcoded",
                 str(scratch_dir),
-                sum(f["bytes"] for f in result["files"]),
+                total_bytes,
                 audio["sha256"],
                 json.dumps(result["files"]),
                 token,
@@ -192,6 +250,10 @@ def _finish(job_id: str, result: dict, scratch_dir: Path) -> None:
                 job_id,
             ),
         )
+    # Recorded against actual bytes produced, not the /resolve-time estimate —
+    # that estimate is what gates starting a *new* job (see create_items), but
+    # what actually counts against the budget is what actually got made.
+    _record_usage(user_id, total_bytes)
 
 
 def _fail(job_id: str, message: str, scratch_dir: Path) -> None:
@@ -201,6 +263,51 @@ def _fail(job_id: str, message: str, scratch_dir: Path) -> None:
             "UPDATE jobs SET state='failed', error=?, updated_at=? WHERE id=?",
             (message[:1000], db.now(), job_id),
         )
+
+
+# ------------------------------------------------------------- circuit breaker
+#
+# R-10: multi-user means yt-dlp reaches YouTube from one shared server IP. A
+# 429 hitting one user's job is a signal about that shared IP, not just about
+# that job — letting every other queued job keep hammering through right after
+# just earns a harder rate limit for everyone. So this pauses *claiming*
+# entirely for a backoff window instead of retrying the one job that hit it.
+
+BREAKER_BASE_S = 30
+BREAKER_MAX_S = 10 * 60
+
+_breaker_until = 0.0  # monotonic deadline; claiming pauses until this passes
+_consecutive_429s = 0
+
+
+def _is_rate_limited(message: str) -> bool:
+    return "429" in message or "Too Many Requests" in message
+
+
+def _trip_breaker() -> None:
+    global _breaker_until, _consecutive_429s
+    _consecutive_429s += 1
+    backoff = min(BREAKER_BASE_S * (2 ** (_consecutive_429s - 1)), BREAKER_MAX_S)
+    _breaker_until = time.monotonic() + backoff + random.random() * backoff * 0.25
+    print(
+        f"[breaker] 429 detected — pausing the queue for ~{backoff:.0f}s"
+        f" (consecutive: {_consecutive_429s})",
+        flush=True,
+    )
+
+
+def _reset_breaker() -> None:
+    global _consecutive_429s
+    _consecutive_429s = 0
+
+
+def breaker_status() -> dict:
+    remaining = max(_breaker_until - time.monotonic(), 0)
+    return {
+        "tripped": remaining > 0,
+        "retry_after_s": round(remaining),
+        "consecutive_429s": _consecutive_429s,
+    }
 
 
 def _reap() -> None:
@@ -224,6 +331,10 @@ def _reap() -> None:
 
 def _runner() -> None:
     while not _stop.is_set():
+        if time.monotonic() < _breaker_until:
+            _stop.wait(1)
+            continue
+
         try:
             _reap()
             job = _claim()
@@ -247,16 +358,21 @@ def _runner() -> None:
                     (job["item_id"],),
                 ).fetchone()
             profile = json.loads(row["format_profile"])
+            cookies_text = _user_cookies(job["user_id"])
             future = _job_pool.submit(
-                pipeline.run, row["canonical_url"], profile, str(scratch_dir)
+                pipeline.run, row["canonical_url"], profile, str(scratch_dir), cookies_text
             )
             _pump_progress(job["id"], future, scratch_dir)
-            _finish(job["id"], future.result(timeout=0), scratch_dir)
+            _finish(job["id"], future.result(timeout=0), scratch_dir, job["user_id"])
+            _reset_breaker()  # a completed job is proof the shared IP isn't blocked right now
         except FutureTimeout:
             future.cancel()
             _fail(job["id"], f"Gave up after {JOB_TIMEOUT_S // 60} minutes.", scratch_dir)
         except Exception as err:
-            _fail(job["id"], f"{type(err).__name__}: {err}", scratch_dir)
+            message = f"{type(err).__name__}: {err}"
+            _fail(job["id"], message, scratch_dir)
+            if _is_rate_limited(message):
+                _trip_breaker()
 
 
 def _pump_progress(job_id: str, future, scratch_dir: Path) -> None:
@@ -376,11 +492,15 @@ def health() -> dict:
 @app.get("/health/extractors")
 def health_extractors():
     """Result of the periodic canary — your early warning for extractor
-    breakage, which is the single most likely thing to take this app down."""
+    breakage, which is the single most likely thing to take this app down.
+    Also carries the 429 circuit breaker's state (R-10) — the two are related
+    monitoring concerns (is the extractor path healthy right now) even though
+    the breaker reacts to real jobs, not the canary."""
+    breaker = breaker_status()
     if not _canary:
-        return {"extractors": {}, "note": "no canary run has completed yet"}
-    status = 200 if all(r["ok"] for r in _canary.values()) else 503
-    return JSONResponse({"extractors": _canary}, status_code=status)
+        return {"extractors": {}, "circuit_breaker": breaker, "note": "no canary run has completed yet"}
+    status = 200 if all(r["ok"] for r in _canary.values()) and not breaker["tripped"] else 503
+    return JSONResponse({"extractors": _canary, "circuit_breaker": breaker}, status_code=status)
 
 
 # --------------------------------------------------------------------- auth
@@ -419,6 +539,75 @@ def logout(authorization: str | None = Header(default=None)):
     # Server-side only — see 04-api.md. The client separately never clears
     # the local catalogue/OPFS on logout; see FM-2.
     auth.delete_session(authorization)
+    return {"ok": True}
+
+
+@app.get("/me")
+def me(user: dict = Depends(auth.current_user)):
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT id, email, display_name, daily_byte_budget, max_concurrent, created_at"
+            " FROM users WHERE id = ?",
+            (user["id"],),
+        ).fetchone()
+    return dict(row)
+
+
+@app.get("/me/usage")
+def me_usage(user: dict = Depends(auth.current_user)):
+    with db.reading() as conn:
+        budget = conn.execute(
+            "SELECT daily_byte_budget FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()["daily_byte_budget"]
+        active_jobs = conn.execute(
+            "SELECT COUNT(*) AS c FROM jobs"
+            " WHERE user_id = ? AND state IN ('queued','fetching','transforming')",
+            (user["id"],),
+        ).fetchone()["c"]
+    used = _usage_today(user["id"])
+    return {
+        "bytes_used_today": used,
+        "daily_byte_budget": budget,
+        "remaining_bytes": max(budget - used, 0),
+        "active_jobs": active_jobs,
+    }
+
+
+class CookiesRequest(BaseModel):
+    # Netscape cookie-file format — exactly what yt-dlp's `cookiefile` option
+    # (and browser extensions that export cookies) already produce.
+    cookies: str = Field(min_length=1)
+
+
+@app.put("/me/cookies")
+def put_cookies(req: CookiesRequest, user: dict = Depends(auth.current_user)):
+    encrypted = _fernet.encrypt(req.cookies.encode())
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE users SET cookies_encrypted = ?, cookies_updated_at = ? WHERE id = ?",
+            (encrypted, db.now(), user["id"]),
+        )
+    return {"ok": True}
+
+
+@app.get("/me/cookies")
+def get_cookies_status(user: dict = Depends(auth.current_user)):
+    # Write-only from the client's perspective — this reports whether cookies
+    # are configured and when, never the plaintext (or ciphertext) back out.
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT cookies_updated_at FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+    return {"configured": row["cookies_updated_at"] is not None, "updated_at": row["cookies_updated_at"]}
+
+
+@app.delete("/me/cookies")
+def delete_cookies(user: dict = Depends(auth.current_user)):
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE users SET cookies_encrypted = NULL, cookies_updated_at = NULL WHERE id = ?",
+            (user["id"],),
+        )
     return {"ok": True}
 
 
@@ -471,7 +660,7 @@ def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
     """
     try:
         kind, payload = _resolve_pool.submit(
-            extract.probe, req.url, req.format_profile.audio_bitrate
+            extract.probe, req.url, req.format_profile.audio_bitrate, _user_cookies(user["id"])
         ).result(timeout=RESOLVE_TIMEOUT_S)
     except FutureTimeout:
         return error(
@@ -502,9 +691,31 @@ def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
+def _next_utc_midnight() -> str:
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+    return f"{tomorrow.isoformat()}T00:00:00.000Z"
+
+
 @app.post("/items")
 def create_items(req: ItemsRequest, user: dict = Depends(auth.current_user)):
     """Stage 3. Creates items and enqueues jobs. Idempotent on (user, source)."""
+    # Checked once per call, against today's already-recorded usage — not a
+    # precise projection of what this batch would add (that would need every
+    # entry's estimated size threaded through from /resolve). Good enough to
+    # stop someone starting new downloads once they're already over budget for
+    # the day; the budget is a rough daily cap, not a hard byte-exact ledger.
+    with db.reading() as conn:
+        daily_budget = conn.execute(
+            "SELECT daily_byte_budget FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()["daily_byte_budget"]
+    if _usage_today(user["id"]) >= daily_budget:
+        return error(
+            429,
+            "quota_exceeded",
+            f"This would exceed today's {daily_budget / 1e9:.1f} GB limit.",
+            retry_after=_next_utc_midnight(),
+        )
+
     created = []
     for entry in req.entries:
         with db.reading() as conn:
@@ -706,6 +917,89 @@ def patch_playlist_items(
                 (db.now(), db.now(), playlist_id, item_id),
             )
     return {"ok": True}
+
+
+# ------------------------------------------------------------------- sync
+#
+# Multi-device convergence, pull half. The push half is already done: every
+# offline mutation replays through the same idempotent REST endpoints above
+# (D-018) — a dedicated /sync/outbox batch endpoint would just be a second,
+# redundant way to call code that already exists. What was actually missing
+# is a way for a device to learn what *another* device did, which is this.
+#
+# Cursor is opaque to the client: a base64url JSON blob of one (updated_at,
+# id) position per table. Row-value comparison — `(updated_at, id) > (?, ?)`
+# — is what 03-data-model.md's cursor design is for: it can't skip a row that
+# shares a millisecond with the cursor's own row, which plain `updated_at > ?`
+# would.
+
+
+def _encode_cursor(positions: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(positions).encode()).decode()
+
+
+def _decode_cursor(raw: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        return json.loads(base64.urlsafe_b64decode(raw.encode()))
+    except Exception:
+        return {}  # a corrupt/foreign cursor degrades to "sync everything", not a 500
+
+
+@app.get("/sync")
+def sync(since: str = "", user: dict = Depends(auth.current_user)):
+    cursor = _decode_cursor(since)
+    uid = user["id"]
+
+    items_ts, items_id = cursor.get("items", ["", ""])
+    playlists_ts, playlists_id = cursor.get("playlists", ["", ""])
+    pi_ts, pi_pid, pi_iid = cursor.get("playlist_items", ["", "", ""])
+
+    with db.reading() as conn:
+        items = conn.execute(
+            """SELECT i.id, i.source_key, i.format_profile, i.added_at,
+                      i.updated_at, i.deleted_at, s.title, s.uploader, s.duration_s
+                 FROM library_items i JOIN sources s ON s.source_key = i.source_key
+                WHERE i.user_id = ? AND (i.updated_at, i.id) > (?, ?)
+                ORDER BY i.updated_at, i.id""",
+            (uid, items_ts, items_id),
+        ).fetchall()
+        playlists = conn.execute(
+            """SELECT id, name, created_at, updated_at, deleted_at FROM playlists
+                WHERE user_id = ? AND (updated_at, id) > (?, ?)
+                ORDER BY updated_at, id""",
+            (uid, playlists_ts, playlists_id),
+        ).fetchall()
+        playlist_items = conn.execute(
+            """SELECT pi.playlist_id, pi.item_id, pi.position, pi.updated_at, pi.deleted_at
+                 FROM playlist_items pi JOIN playlists p ON p.id = pi.playlist_id
+                WHERE p.user_id = ? AND (pi.updated_at, pi.playlist_id, pi.item_id) > (?, ?, ?)
+                ORDER BY pi.updated_at, pi.playlist_id, pi.item_id""",
+            (uid, pi_ts, pi_pid, pi_iid),
+        ).fetchall()
+
+    new_cursor = {
+        "items": [items[-1]["updated_at"], items[-1]["id"]] if items else [items_ts, items_id],
+        "playlists": [playlists[-1]["updated_at"], playlists[-1]["id"]]
+        if playlists
+        else [playlists_ts, playlists_id],
+        "playlist_items": [
+            playlist_items[-1]["updated_at"],
+            playlist_items[-1]["playlist_id"],
+            playlist_items[-1]["item_id"],
+        ]
+        if playlist_items
+        else [pi_ts, pi_pid, pi_iid],
+    }
+    return {
+        "items": [
+            {**dict(r), "format_profile": json.loads(r["format_profile"])} for r in items
+        ],
+        "playlists": [dict(r) for r in playlists],
+        "playlist_items": [dict(r) for r in playlist_items],
+        "cursor": _encode_cursor(new_cursor),
+    }
 
 
 def _job_json(row) -> dict:

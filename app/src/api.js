@@ -146,6 +146,23 @@ export const patchPlaylistItems = (playlistId, upserts = [], removes = []) =>
     body: JSON.stringify({ upserts, removes }),
   });
 
+// ----------------------------------------------------------------------- sync
+
+// `cursor` is opaque — whatever the server returned last time, or '' for a
+// first-ever sync. The push half of multi-device convergence needs no
+// dedicated endpoint: every offline mutation already replays through the
+// idempotent REST calls above (see outbox.js, D-018). This is just the pull.
+export const sync = (cursor) => request(`/sync?since=${encodeURIComponent(cursor ?? '')}`);
+
+// ------------------------------------------------------------------- account
+
+export const me = () => request('/me');
+export const meUsage = () => request('/me/usage');
+export const putCookies = (cookies) =>
+  request('/me/cookies', { method: 'PUT', body: JSON.stringify({ cookies }) });
+export const cookiesStatus = () => request('/me/cookies');
+export const deleteCookies = () => request('/me/cookies', { method: 'DELETE' });
+
 export const listJobs = () => request('/jobs');
 
 export const retryJob = (id) => request(`/jobs/${id}/retry`, { method: 'POST' });

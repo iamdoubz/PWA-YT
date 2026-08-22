@@ -514,3 +514,73 @@ service-worker HTTPS.
 **What would change this.** Nothing about the resident-key or ceremony-
 storage decisions. The origin/RP_ID story gets revisited if this ever runs
 behind a fixed production domain instead of a dev tunnel.
+
+---
+
+## D-020 · The rest of v0.4 — sync, budgets, cookies, backoff
+
+**Status:** accepted · 2026-08-22 · v0.4 (continuation of the foundation pass)
+
+**Decision 1 — no `/sync/outbox` endpoint, full stop.** `04-api.md` originally
+specified one, with per-mutation idempotency keys. D-018 already established
+that the *push* half of offline mutation needs neither: every mutating
+endpoint is naturally replay-safe (client-generated ids, last-write-wins,
+`ON CONFLICT DO UPDATE`), so the client's outbox just re-issues the original
+REST call. Multi-device sync's actual gap was never push — it was *pull*:
+nothing let a device learn what another device signed into the same account
+did. `GET /sync` is that, and only that.
+
+**Decision 2 — the sync cursor is opaque, per-table, and row-value-compared.**
+Three resources (`items`, `playlists`, `playlist_items`) have different key
+shapes — a single global timestamp cursor can't serve all three without
+either skipping same-millisecond rows or over-fetching. The cursor is a
+base64url JSON blob of one `(updated_at, id)` position per table (three
+elements for `playlist_items`, whose key is `(playlist_id, item_id)`), and
+every query uses SQLite row-value comparison — `(updated_at, id) > (?, ?)` —
+which is exactly the guarantee 03-data-model.md's cursor design asked for.
+A corrupt or foreign cursor decodes to "sync everything" rather than a 500.
+
+**Decision 3 — no pagination on `/sync`, `/jobs` stays capped at 50.** Both
+are documented, deliberate gaps at this app's actual scale (a handful of
+invited users, personal libraries). Revisit if a library or an account's
+history ever gets big enough for one `/sync` response to matter.
+
+**Decision 4 — the budget check is a gate, not a ledger-precise projection.**
+`POST /items` refuses new jobs once today's *already-recorded* usage meets
+or exceeds `daily_byte_budget` — it does not try to project whether *this*
+batch's estimated size would tip it over first. Getting that exactly right
+would mean threading `estimated_bytes` from `/resolve` through every
+`ItemEntry`, for a budget that's already just a rough daily cap, not
+billing. Actual bytes are recorded in `usage_ledger` only once a job
+finishes (`_record_usage`), against what was actually produced — the
+`/resolve`-time estimate is what a user sees before committing, never what
+counts against them after.
+
+**Decision 5 — cookies are Fernet-encrypted, and a decrypt failure degrades
+silently.** `cryptography` was already a transitive dependency (via
+`webauthn`) and is now a direct one, since main.py imports it itself.
+`PWA_YT_COOKIE_KEY` is generated per-process-start and printed to the log if
+unset — convenient for a quick local run, but anything meant to survive a
+restart must set it explicitly. If cookies were encrypted under a key that's
+since changed, `_user_cookies()` returns `None` rather than raising: a
+resolve or download for a user whose private-content cookies no longer
+decrypt must still work for everything that isn't gated behind them, not
+fail outright over stale secrets.
+
+**Decision 6 — the circuit breaker pauses claiming globally, not just the
+one job that hit a 429.** R-10's actual risk is a shared server IP getting
+rate-limited on behalf of every user at once. Retrying the one job that got
+a 429 (with backoff) protects nothing else already queued behind it —
+pausing `_runner()`'s claim loop entirely for an exponentially-growing
+window (30s, 60s, 120s… capped at 10 minutes, plus jitter) does. A
+successful job resets the counter; the breaker's state rides along on
+`/health/extractors`, the same place the canary already reports extractor
+health, since both are "is the yt-dlp path OK right now" questions.
+Deliberately *not* built: automatic per-job retry-with-backoff for
+non-429 failures — that's a different, larger problem (distinguishing
+transient from permanent failures) and the manual retry button already
+covers it.
+
+**What would change this.** Pagination, the moment either `/sync` or `/jobs`
+actually gets slow at real scale. The budget-gate approximation, if daily
+overshoot from in-flight jobs ever proves to matter in practice.

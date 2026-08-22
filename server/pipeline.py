@@ -135,7 +135,7 @@ def _artwork(scratch: Path, info: dict, source: Path) -> bool:
     return True
 
 
-def run(url: str, profile: dict, scratch_dir: str) -> dict:
+def run(url: str, profile: dict, scratch_dir: str, cookies_text: str | None = None) -> dict:
     """Fetch and transform. Returns the manifest the client will pull."""
     if profile.get("keep_video"):
         raise TransformError("video arrives in v1.0; keep_video must be false")
@@ -146,6 +146,14 @@ def run(url: str, profile: dict, scratch_dir: str) -> dict:
     scratch = Path(scratch_dir)
     scratch.mkdir(parents=True, exist_ok=True)
     _report(scratch, "fetching", 0.0)
+
+    # Written into the job's own scratch dir, which is already tmpfs and
+    # already deleted on completion or failure — no separate cleanup needed.
+    # Decrypted cookies never exist anywhere but here and for exactly as long
+    # as this job runs.
+    cookie_path = scratch / "cookies.txt"
+    if cookies_text:
+        cookie_path.write_text(cookies_text)
 
     last = [0.0]
 
@@ -170,11 +178,17 @@ def run(url: str, profile: dict, scratch_dir: str) -> dict:
         "writethumbnail": profile.get("save_artwork", True),
         "progress_hooks": [on_progress],
     }
+    if cookies_text:
+        opts["cookiefile"] = str(cookie_path)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as err:
         raise TransformError(str(err)) from err
+    finally:
+        # Gone the moment yt-dlp is done with it, not just whenever scratch
+        # eventually gets swept — the ffmpeg stages below don't need it.
+        cookie_path.unlink(missing_ok=True)
 
     source = Path(info["requested_downloads"][0]["filepath"])
     _report(scratch, "transforming", FETCH_SHARE)

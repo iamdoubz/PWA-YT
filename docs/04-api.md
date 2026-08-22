@@ -96,16 +96,34 @@ the TTL reaper, which is a correctness backstop, not the happy path.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/sync?since={cursor}` | Changed rows + tombstones across items, playlists, playlist_items. Returns a new cursor. |
-| `POST` | `/sync/outbox` | Replays queued offline mutations. Each carries an idempotency key. |
+
+`cursor` is opaque to the client — a base64url JSON blob carrying one
+`(updated_at, id)` position per table, so a row that shares a millisecond
+with the cursor's own row is never skipped (row-value comparison). Pass `''`
+(or omit `since`) for a first-ever sync, which returns full history.
+
+**`POST /sync/outbox` was not built.** The original design called for a
+dedicated batch-replay endpoint with per-mutation idempotency keys. It turned
+out to be unnecessary: every mutating endpoint above is already safe to
+replay as-is — creates take a client-generated id (`ON CONFLICT DO NOTHING`),
+renames/deletes are last-write-wins, and the playlist-items patch is
+`ON CONFLICT DO UPDATE`. The client's outbox (`app/src/outbox.js`) just
+re-issues the original REST call. See D-018 and D-020.
 
 ## Account
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/me` | Profile, budgets, concurrency limit. |
-| `GET` | `/me/usage` | Bytes used today, remaining budget, active job count. |
-| `PUT` | `/me/settings` | Default format profile, client-transcode preference. |
-| `PUT` | `/me/cookies` | Optional per-user cookie jar for private content. Encrypted at rest, scoped strictly to this user's jobs. |
+| `GET` | `/me` | Profile, daily byte budget, concurrency limit. |
+| `GET` | `/me/usage` | `{bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs}`. |
+| `PUT` | `/me/cookies` | `{cookies}` — Netscape cookie-file text. Encrypted at rest (Fernet); never returned once saved. |
+| `GET` | `/me/cookies` | `{configured, updated_at}` only — write-only from the client's perspective. |
+| `DELETE` | `/me/cookies` | Clears the jar. |
+
+**`PUT /me/settings` was not built.** There is no per-user setting yet worth
+a dedicated endpoint — client-transcode preference is a v1.0 concept, and
+default format profile is still just a client-local default. Add this when
+a real setting needs to live server-side.
 
 ## Health
 

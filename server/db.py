@@ -25,14 +25,18 @@ DEV_USER_EMAIL = "dev@localhost"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-  id                TEXT PRIMARY KEY,
-  email             TEXT NOT NULL UNIQUE,
-  display_name      TEXT,
-  invited_by        TEXT REFERENCES users(id),
-  daily_byte_budget INTEGER NOT NULL DEFAULT 5368709120,
-  max_concurrent    INTEGER NOT NULL DEFAULT 2,
-  created_at        TEXT NOT NULL,
-  disabled_at       TEXT
+  id                  TEXT PRIMARY KEY,
+  email               TEXT NOT NULL UNIQUE,
+  display_name        TEXT,
+  invited_by          TEXT REFERENCES users(id),
+  daily_byte_budget   INTEGER NOT NULL DEFAULT 5368709120,
+  max_concurrent      INTEGER NOT NULL DEFAULT 2,
+  created_at          TEXT NOT NULL,
+  disabled_at         TEXT,
+  -- Fernet-encrypted (see main.py); write-only from the client's perspective
+  -- — there is no endpoint that ever returns the plaintext back out.
+  cookies_encrypted   BLOB,
+  cookies_updated_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS credentials (

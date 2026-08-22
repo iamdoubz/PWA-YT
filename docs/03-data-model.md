@@ -31,14 +31,16 @@ assert it at startup rather than discovering it in production.
 
 ```sql
 CREATE TABLE users (
-  id                TEXT PRIMARY KEY,              -- UUIDv7
-  email             TEXT NOT NULL UNIQUE,
-  display_name      TEXT,
-  invited_by        TEXT REFERENCES users(id),
-  daily_byte_budget INTEGER NOT NULL DEFAULT 5368709120,   -- 5 GiB
-  max_concurrent    INTEGER NOT NULL DEFAULT 2,
-  created_at        TEXT NOT NULL,
-  disabled_at       TEXT
+  id                  TEXT PRIMARY KEY,              -- UUIDv7
+  email               TEXT NOT NULL UNIQUE,
+  display_name        TEXT,
+  invited_by          TEXT REFERENCES users(id),
+  daily_byte_budget   INTEGER NOT NULL DEFAULT 5368709120,   -- 5 GiB
+  max_concurrent      INTEGER NOT NULL DEFAULT 2,
+  created_at          TEXT NOT NULL,
+  disabled_at         TEXT,
+  cookies_encrypted   BLOB,                          -- Fernet; write-only, see 04-api.md
+  cookies_updated_at  TEXT
 );
 
 CREATE TABLE credentials (                          -- WebAuthn passkeys

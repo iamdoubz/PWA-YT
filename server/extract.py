@@ -6,6 +6,9 @@ that means spawn, which re-imports this module in the child — so it must stay
 free of import-time side effects. No FastAPI, no DB, no pool. Keep it that way.
 """
 
+import os
+import tempfile
+
 import yt_dlp
 
 # Preferring an mp4a stream up front is what makes prefer_copy pay off later.
@@ -59,7 +62,7 @@ def _flat_entry(entry: dict, bitrate_kbps: int, fallback_extractor: str) -> dict
     }
 
 
-def probe(url: str, bitrate_kbps: int) -> tuple[str, dict]:
+def probe(url: str, bitrate_kbps: int, cookies_text: str | None = None) -> tuple[str, dict]:
     """extract_info(download=False), flat. Returns a plan, never a job.
 
     One call handles both shapes: a plain video/track URL comes back fully
@@ -67,6 +70,11 @@ def probe(url: str, bitrate_kbps: int) -> tuple[str, dict]:
     not a solo item), and a playlist URL comes back as flat entries — which is
     what makes resolving a 400-entry playlist take about as long as one lookup,
     since nothing per-entry is fetched.
+
+    `cookies_text`, if given, is this user's decrypted private-content cookie
+    jar — written to a temp file for exactly the duration of this call and
+    deleted immediately after, win or lose. This process has no scratch
+    directory of its own the way a download job does.
     """
     opts = {
         "quiet": True,
@@ -75,11 +83,22 @@ def probe(url: str, bitrate_kbps: int) -> tuple[str, dict]:
         "format": AUDIO_FORMAT,
         "extract_flat": "in_playlist",
     }
+    cookie_file = None
+    if cookies_text:
+        cookie_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        )
+        cookie_file.write(cookies_text)
+        cookie_file.close()
+        opts["cookiefile"] = cookie_file.name
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as err:
         raise ResolveError(str(err)) from err
+    finally:
+        if cookie_file:
+            os.unlink(cookie_file.name)
 
     if info.get("_type") == "playlist":
         fallback_extractor = (info.get("extractor_key") or "").lower()

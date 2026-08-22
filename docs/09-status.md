@@ -1,15 +1,19 @@
 # Build status
 
-**As of:** 2026-08-22 · commit `15f94da` + uncommitted v0.4 work (auth foundation)
+**As of:** 2026-08-22 · commit `bcfb0e3` + uncommitted v0.4 work (rest of it)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
-**Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3. v0.4 is **partial by
-design** — see §1a. The auth *foundation* (passkeys, invite codes, sessions,
-every endpoint scoped per-user) is built; per-user budgets, multi-device sync,
-the cookie jar, and 429 backoff were deliberately left for a follow-up pass,
-at the owner's explicit choice.
-**Verified on:** desktop Chrome only. The WebAuthn ceremony itself reaches a
-real native passkey prompt (confirmed live) but has not been completed
-end-to-end — see §1a.
+**Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
+v0.4 subsystems are now built: passkeys + invites + sessions, per-user
+budgets + usage ledger, multi-device `/sync`, the encrypted cookie jar, and
+429 backoff/circuit-breaker. One thing in it is still genuinely unverified —
+see §1a.
+**Verified on:** desktop Chrome only. Server-side auth/budgets/cookies/sync
+were verified live with **two real accounts** (not just unit tests) by
+minting sessions directly and driving the actual HTTP surface — real
+multi-user isolation, real cross-device convergence. The one thing *not*
+verified live is completing an actual WebAuthn signature — that reaches a
+real native passkey prompt (confirmed) but needs a human at an authenticator
+to finish, same category of gap as the device test in §1.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -40,22 +44,20 @@ be started retroactively.
 
 ---
 
-## 1a. v0.4 is intentionally partial, and the passkey ceremony is unverified end-to-end
+## 1a. What's real evidence vs. what still needs a human at an authenticator
 
-v0.4 bundles five fairly independent subsystems (`06-build-plan.md`). Asked
-up front how to sequence them, the owner chose **foundation first, then
-pause for review**: passkeys + invite codes + sessions + every endpoint
-scoped to the authenticated user, stop there. Per-user budgets/usage ledger,
-multi-device `/sync`, the encrypted cookie jar, and 429 backoff/circuit-
-breaker are **not built** — this is a deliberate, agreed stopping point, not
-a phase abandoned partway through.
+v0.4 bundles five fairly independent subsystems (`06-build-plan.md`): passkeys
++ invite codes + sessions, per-user budgets + usage ledger, multi-device
+`/sync`, the encrypted cookie jar, and 429 backoff/circuit-breaker. Asked up
+front how to sequence them, the owner chose **foundation first, then pause
+for review**; the foundation landed, got reviewed, and this session finished
+the other four.
 
-**The WebAuthn ceremony has not been completed live.** Testing it end-to-end
-needs a real authenticator (Windows Hello, Touch ID, or a security key)
-responding to a native OS prompt — the same category of thing the device gate
-in §1 already can't do from this sandbox, for the same reason: it needs a
-human at the keyboard, not another round of automation. What *was* verified
-live, in a real browser:
+**The one thing still not verified live is completing an actual WebAuthn
+signature.** That needs a real authenticator (Windows Hello, Touch ID, a
+security key) responding to a native OS prompt — the same category of gap as
+the device test in §1, for the same reason: it needs a human at the
+keyboard, not another round of automation. What *was* verified, live:
 
 - The sign-in/register screen renders with zero network calls (FM-2), and is
   usernameless — no username field anywhere, by design (D-019).
@@ -66,21 +68,48 @@ live, in a real browser:
   (`document.visibilityState` flipped to `'hidden'` with `hasFocus()` still
   `true` — the tab yielding to a real OS-level dialog, not a JS error).
   Automation has no way to drive that dialog (it's outside the DOM/CDP
-  entirely), so the ceremony was abandoned there rather than forced through.
-- Abandoning it left **no trace**: the invite code stayed unused, no partial
-  user row was created. That's `finish_registration`'s transaction working
+  entirely), so the ceremony was abandoned there rather than forced through,
+  and abandoning it left **no trace**: the invite code stayed unused, no
+  partial user row was created. `finish_registration`'s transaction working
   as designed, not luck.
-- Every server-side auth code path that doesn't need a real signature —
-  invite validation (unknown/used codes), session create/validate/expire/
-  logout, ceremony single-use/expiry — is covered by
-  `test_server.py` and passes.
 
-**What this means for acceptance criterion v0.4-1** ("two users cannot see or
-affect each other's items, jobs, scratch, or cookies"): every query in
-`main.py` is now scoped by the authenticated user's id (verified by reading
-the code, and by the unauthenticated-request tests returning 401), but this
-has not been proven with **two real accounts** signing in and checking they
-can't see each other's data — that needs a completed registration first.
+**Everything downstream of "have a session token" was verified live anyway**
+— by minting real sessions directly (`auth.create_session()`, bypassing only
+the WebAuthn signature itself, not any authorization logic) for two real
+accounts, Alice and Bob, and driving the actual HTTP surface and the actual
+browser client against them:
+
+- **Acceptance criterion v0.4-1** (two users can't see/affect each other's
+  data) — Bob's `PATCH /playlists/{alice's-id}` returned `404 not_found` and
+  genuinely had no effect; `GET /playlists` as Bob returned `[]` while
+  Alice's existed. Not code-reading — an actual cross-account request that
+  actually failed the way it's supposed to.
+- **Cookie jar isolation** — Alice's `GET /me/cookies` showed `configured:
+  true` after saving some; Bob's showed `false`. Different users, different
+  encrypted blobs, no leakage.
+- **Multi-device sync (criterion v0.4-4)** — created a playlist as Alice,
+  synced, got a cursor; renamed the *same playlist* via a second `curl` call
+  (simulating a second device) without ever pulling again; re-synced from the
+  *first* device's old cursor and got back exactly that one change. Then, in
+  an actual browser with a seeded session token and zero prior local state,
+  the client's `reconcile()` pulled that server-side rename down into
+  IndexedDB and rendered it correctly on first load — the whole client-side
+  merge path, not just the server query.
+- **Push still works post-sync** — renamed the playlist again from *within*
+  that browser session; `GET /playlists` via `curl` immediately showed the
+  new name. Round trip confirmed both directions.
+- **Usage/budget** — `GET /me/usage` returned correct, isolated figures per
+  account; the client's account panel displayed them.
+- Every server-side path that doesn't need a real signature — invite
+  validation, session lifecycle, ceremony single-use/expiry, usage ledger
+  accumulation + budget gating, cookie encrypt/decrypt + key-rotation
+  degradation, circuit-breaker backoff math, sync cursor correctness and
+  ownership scoping — is pinned by `test_server.py` (18 checks, 0 failures).
+
+So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
+can be **without** a real passkey completing — the only piece that couldn't
+be exercised this way is the cryptographic signature ceremony itself, because
+there was no way to fabricate a valid one without an actual authenticator.
 
 ---
 
@@ -98,6 +127,7 @@ app/                          the PWA — owns all durable media
   src/db.svelte.js            IndexedDB v4: items, local_media, playlists,
                                playlist_items, outbox, meta
   src/outbox.js                offline mutation queue; replays on reconnect
+  src/sync.js                  pull half of multi-device convergence (LWW)
   src/id.js                    client uuid7() for offline-created playlists
   src/opfs-worker.js          the ONLY thing that touches OPFS
   # auth: no separate module — bearer token + auth calls live in api.js,
@@ -114,7 +144,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              13 checks, plain asserts, no pytest
+  test_server.py              18 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -144,6 +174,12 @@ server/                       stateless transformer — never a media library
 | `POST` | `/auth/login/begin` | usernameless — no body, empty `allowCredentials` |
 | `POST` | `/auth/login/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}` |
 | `POST` | `/auth/logout` | invalidates the session server-side only |
+| `GET` | `/me` | profile, `daily_byte_budget`, `max_concurrent` |
+| `GET` | `/me/usage` | `{bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs}` |
+| `PUT` | `/me/cookies` | `{cookies}` (Netscape format) → Fernet-encrypted at rest |
+| `GET` | `/me/cookies` | `{configured, updated_at}` — write-only, never returns the jar |
+| `DELETE` | `/me/cookies` | clears it |
+| `GET` | `/sync?since={cursor}` | changed rows + tombstones across items/playlists/playlist_items; opaque per-table cursor (D-020) |
 
 Every endpoint above `/auth/*`, `/health`, and `/health/extractors` now
 requires a valid bearer session (`Depends(auth.current_user)`) and scopes its
@@ -177,10 +213,10 @@ All seven stages run. Evidence from real runs, not assertion:
 | v0.3 | 1 · assertions 9–14 of the offline test protocol | **NOT RUN on device** — see below |
 | v0.3 | 2 · playlist streams with a running size estimate | pass, **with a caveat** — real 2-track playlist, not 400 entries |
 | v0.3 | 3 · 200-track offline reorder, one outbox row per move, replays after 4h | **mechanism** verified (create/rename/delete a playlist and delete an item while the server was down, then reconnected — outbox drained in order, server state matched); reorder specifically and the 4-hour/200-track scale were not exercised |
-| v0.4 | 1 · two users can't see/affect each other's items, jobs, scratch | **code-scoped, not proven** — every query filters by the authenticated user's id; not demonstrated with two real signed-in accounts (needs a completed passkey ceremony first, see §1a) |
-| v0.4 | 2 · expired session offline → read-only, not logout | built (`readOnly` flag on a 401 or a locally-expired `expires_at`; `db.remove('meta','session')` is the *only* thing logout touches) but not exercised against a real expired session |
-| v0.4 | 3 · one user's full queue doesn't delay another's jobs | **inherited, not new** — the per-user `max_concurrent` correlated subquery in `_claim()` has been there since v0.1; only meaningfully testable with two real accounts each queuing jobs |
-| v0.4 | 4 · same account converges across two devices | **not built** — this is `/sync`, explicitly deferred past the foundation pass |
+| v0.4 | 1 · two users can't see/affect each other's items, jobs, scratch | **pass, verified with two real accounts** — Bob's cross-account playlist rename 404'd and had no effect; Bob's `/playlists`, `/me/cookies` both came back empty/unconfigured while Alice's held real data. See §1a. |
+| v0.4 | 2 · expired session offline → read-only, not logout | built (`readOnly` flag on a 401 or a locally-expired `expires_at`; `db.remove('meta','session')` is the *only* thing logout touches); not yet exercised against a real expired session in a real browser |
+| v0.4 | 3 · one user's full queue doesn't delay another's jobs | **inherited, not new** — the per-user `max_concurrent` correlated subquery in `_claim()` has been there since v0.1; two-account isolation confirmed for reads/writes (criterion 1), not specifically for queue contention under load |
+| v0.4 | 4 · same account converges across two devices | **pass, verified live** — a server-side change (simulating device 2) showed up correctly via `/sync` from device 1's old cursor, and a fresh browser client with a seeded session pulled and rendered it correctly on load. See §1a. |
 
 Criterion 3's caveat (v0.2): the 50 items were **synthetic artifacts** seeded
 by `server/scripts/seed_queue.py`, not fifty real fetches. It measured the
@@ -226,14 +262,14 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 
 | Phase | Scope | Notes |
 |---|---|---|
-| v0.4 | Magic-link fallback | deferred within the foundation pass itself, not just unstarted — see 04-api.md |
-| v0.4 | Per-user budgets, concurrency caps, usage ledger | concurrency cap has worked since v0.1 (`_claim()`'s correlated subquery); `daily_byte_budget` is a column nothing reads yet, `usage_ledger` exists and is never written |
-| v0.4 | Multi-device sync, tombstones, LWW | `GET /sync` does not exist |
-| v0.4 | Encrypted cookie jar | |
-| v0.4 | Backoff, jitter, circuit breaker on 429s | |
+| v0.4 | Magic-link fallback | deliberately not built, not just unstarted — see 04-api.md |
+| v0.4 | `PUT /me/settings` | no real per-user setting exists yet to justify it — see 04-api.md |
 | v1.0 | Video (`keep_video`), muxing, video view | pipeline rejects `keep_video` |
 | v1.0 | `ffmpeg.wasm` client transcode, COEP | |
 | v1.0 | Nightly `VACUUM INTO` backup | |
+
+All other v0.4 scope — per-user budgets/usage ledger, multi-device sync,
+encrypted cookie jar, 429 backoff/circuit-breaker — is built. See below.
 
 ### v0.4 auth foundation, built this session
 
@@ -258,6 +294,49 @@ usable from IndexedDB, **logout never touches** `items`/`local_media`/OPFS
 Also fixed in passing: CORS was missing `PATCH`/`PUT` in `allow_methods`
 (latent since v0.3's playlist endpoints landed — never surfaced because dev
 traffic is same-origin through the Vite proxy).
+
+### v0.4, the rest of it, built this session
+
+**Budgets + usage ledger.** `_finish()` records actual produced bytes into
+`usage_ledger` per user per UTC day; `POST /items` refuses new jobs once
+today's recorded usage already meets `daily_byte_budget`, returning the
+`quota_exceeded` shape 04-api.md already specified, `retry_after` set to the
+next UTC midnight. `GET /me` and `GET /me/usage` expose it; the client's
+Account panel shows both, loaded lazily post-first-paint like everything
+else optional (FM-2).
+
+**429 backoff + circuit breaker (R-10).** A 429 detected in any job's error
+message pauses `_runner()`'s *claiming* entirely — not just that one job's
+retry — for an exponentially growing window (30s → 60s → 120s… capped at 10
+minutes, plus jitter), because a shared-IP rate limit is everyone's problem
+the moment it happens to one job. A completed job resets the backoff.
+State rides along on `/health/extractors` as `circuit_breaker`.
+
+**Encrypted cookie jar.** `PUT/GET/DELETE /me/cookies`. Fernet
+(`cryptography`, already a transitive dep via `webauthn`, now direct)
+encrypts a Netscape-format cookie export at rest; decrypted only for the
+lifetime of one resolve or download call, written to a temp file (or the
+job's own already-ephemeral scratch dir) and never anywhere else. A key
+rotation degrades a user's cookies to "not configured" rather than raising —
+verified by a test that swaps the encryption key mid-test and confirms the
+old ciphertext just stops decrypting, cleanly. Client: a paste-a-cookies.txt
+textarea in the Account panel, Save/Clear, status only ("configured N ago"),
+never the plaintext back out.
+
+**Multi-device sync (`GET /sync`).** The pull half only — the push half
+needed no new code, since every offline mutation already replays through
+idempotent REST calls (D-018). Cursor is an opaque base64url JSON blob
+carrying one `(updated_at, id)` position per table (`items`, `playlists`,
+`playlist_items`), compared with SQLite row-values so same-millisecond rows
+are never skipped. Client (`app/src/sync.js`) applies last-write-wins,
+tombstone-wins-ties, and for `items` specifically triggers the same OPFS +
+`local_media` purge a manual delete does — a remote delete must clean up
+local bytes exactly like a local one does. `04-api.md`'s originally-planned
+`POST /sync/outbox` was **not built**; D-020 explains why it turned out to
+be redundant with the existing outbox design.
+
+**Verification for all four was live, not just unit tests** — see §1a for
+exactly what was exercised with two real accounts and a real browser client.
 
 ### v0.3, built this session
 
@@ -287,8 +366,14 @@ is never waiting on OPFS when playback reaches it.
   sweep has thousands of items to open.
 - **ffmpeg progress is coarse.** yt-dlp covers 0 → 0.85, the transform is one
   jump to 0.9. See D-017.
-- **`/jobs` is capped at 50 rows.** Fine for one user, wrong the moment a
-  library is bigger than the queue view.
+- **`/jobs` is capped at 50 rows; `/sync` has no cap at all.** Both fine at
+  this app's actual scale (a handful of invited users, personal libraries);
+  both wrong the moment either gets big. See D-020.
+- **The budget check is a gate, not a precise ledger projection.** `POST
+  /items` refuses a new job once *already-recorded* usage meets the daily
+  cap — it doesn't try to project whether this specific batch's estimated
+  size would tip it over first. Good enough for a rough daily cap; not
+  byte-exact.
 - **The client's local catalogue is not namespaced per user.** IndexedDB
   store `pwa-yt` is one shared set of `items`/`playlists`/`local_media` rows
   regardless of which account is signed in. Fine for the app's actual usage
@@ -335,6 +420,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-017 | Job progress travels as a file in scratch, not an IPC queue |
 | D-018 | Playlist position is opaque to the server (client-only fractional indexing); the outbox replays via existing idempotent REST calls, no idempotency-key ledger |
 | D-019 | Usernameless (discoverable-credential) passkeys throughout; an `invites` table 03-data-model.md never specified; WebAuthn ceremonies held in an in-memory dict, not a table |
+| D-020 | No `/sync/outbox` endpoint — pull-only `/sync` with a per-table opaque cursor; budget check is a gate not a ledger projection; cookie decrypt failures degrade silently; circuit breaker pauses claiming globally, not per-job |
 
 ---
 
@@ -387,10 +473,15 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 13 checks
+cd server && uv run python test_server.py    # 18 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```
+
+Set `PWA_YT_COOKIE_KEY` (a Fernet key) if you want saved cookies to survive a
+restart — otherwise one is generated and printed on every startup, and
+anything encrypted under the previous run's key silently stops decrypting
+(by design, see D-020 — not a bug, but worth knowing before it looks like one).
 
 **Four traps that will cost you an hour each:**
 
@@ -417,7 +508,8 @@ cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 
 ## 7. Where to pick up
 
-In the order I would actually do them:
+v0.4 is code-complete. What's left is verification that needs a human, plus
+v1.0. In the order I would actually do them:
 
 1. **Start the device clock.** Tunnel (`cloudflared tunnel --url
    http://localhost:4173` — a **named** tunnel now, see the fourth trap in §6),
@@ -425,35 +517,28 @@ In the order I would actually do them:
    alone with the device low on free space. Five minutes of work; it starts
    the only test that cannot be hurried. Still true, still not done — every
    phase since v0.1 was built on top of the same risk position.
-2. **Complete a real passkey registration.** This is the one thing in the auth
-   foundation that needs a human, not more code — open the app on an actual
-   device or desktop Chrome with Windows Hello / Touch ID set up, mint an
-   invite (`uv run python scripts/create_invite.py`), and register. Everything
-   up to the native prompt is verified (§1a); this is the last unverified step,
-   and it unblocks acceptance criterion v0.4-1 (register a second account, confirm
-   neither sees the other's items/jobs).
-3. **Run the offline protocol** — `02-offline-playback.md` §5, all 14 assertions.
-   The readiness panel reports `persist()`, OPFS `move()`, and the fetch
-   counter directly on screen, so most assertions are readable without a
-   debugger. The two genuinely unknown answers are whether `persist()`
-   returns true and whether Safari supports OPFS `move()`. This now also
-   needs step 2 done first, since the library only renders signed in.
-4. **Then the rest of v0.4**, in whatever order matters most: per-user
-   budgets + usage ledger (the `daily_byte_budget` column and `usage_ledger`
-   table already exist, unused), multi-device `/sync`, the encrypted cookie
-   jar, and 429 backoff/circuit-breaker. These were deliberately deferred
-   past the foundation pass, at the owner's explicit choice — not started
-   because nobody got to them yet.
-5. ~~Exercise a real playlist import.~~ **Done** — a real 2-track YouTube
-   playlist confirmed the streamed size estimate and full import/download
-   path. Still open: a multi-hundred-entry playlist, to see the streaming
-   render actually earn its keep and check large-N client cost.
-6. ~~Decide whether to cascade-delete `playlist_items`~~ **Done** — deleting a
-   library item now cascades server-side (same transaction) and client-side
-   (`forget()`), pinned by `test_delete_item_cascades_into_playlists`. See
-   D-018.
+2. **Complete a real passkey registration.** The one thing in all of v0.4
+   that needs a human, not more code — open the app on an actual device or
+   desktop Chrome with Windows Hello / Touch ID set up, mint an invite
+   (`uv run python scripts/create_invite.py`), and register. Everything up to
+   the native prompt is verified (§1a); this is the last unverified step, and
+   completing it with a *second* real account would let assertion v0.4-1
+   move from "verified with seeded sessions" to "verified with the actual
+   passkey flow a real user goes through."
+3. **Run the offline protocol** — `02-offline-playback.md` §5, all 14
+   assertions. The readiness panel reports `persist()`, OPFS `move()`, and
+   the fetch counter directly on screen, so most assertions are readable
+   without a debugger. The two genuinely unknown answers are whether
+   `persist()` returns true and whether Safari supports OPFS `move()`. This
+   now also needs step 2 done first, since the library only renders signed in.
+4. **v1.0**, when it's time: video (`keep_video`), muxing, a video view,
+   optional `ffmpeg.wasm` client transcode behind COEP, nightly
+   `VACUUM INTO` backups.
+5. **Magic-link fallback**, if it turns out to matter in practice — passkeys
+   alone have been enough to build and test everything so far. Add it when
+   someone actually needs the recovery path, not before.
 
 If step 1 fails — media does not survive on the device — stop and re-read
 `02-offline-playback.md` §2 before writing any more code. That is the scenario
-the phase ordering existed to catch early, and it would still be much cheaper to
-find out now than after the rest of v0.4.
+the phase ordering existed to catch early, and it would still be much cheaper
+to find out now than after v1.0.

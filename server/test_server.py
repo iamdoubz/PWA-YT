@@ -52,7 +52,13 @@ def test_init_applies_pragmas_and_seeds_user():
         assert row is not None and row["email"] == db.DEV_USER_EMAIL
     db.init()  # idempotent: a restart must not duplicate the dev user
     with db.reading() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+        # Scoped to the dev user specifically, not a total row count — other
+        # tests legitimately create their own throwaway users, and test order
+        # is alphabetical, not declaration order.
+        assert (
+            conn.execute("SELECT COUNT(*) FROM users WHERE id = ?", (db.DEV_USER_ID,)).fetchone()[0]
+            == 1
+        )
 
 
 def test_foreign_keys_are_enforced():
@@ -274,6 +280,162 @@ def test_registration_and_login_ceremonies_generate_valid_options():
         "showing every discoverable credential is the whole point"
     )
     assert login_ceremony_id != ceremony_id
+
+
+def test_usage_ledger_accumulates_and_gates_new_jobs():
+    import main
+
+    user_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, daily_byte_budget, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user_id, f"{user_id}@example.com", "Budget Test", 1000, db.now()),
+        )
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+            " VALUES (?,?,?,?,?)",
+            ("youtube:budget-test", "youtube", "budget-test", "http://x", db.now()),
+        )
+
+    assert main._usage_today(user_id) == 0
+    main._record_usage(user_id, 600)
+    assert main._usage_today(user_id) == 600
+    main._record_usage(user_id, 600)  # now over the 1000-byte budget
+    assert main._usage_today(user_id) == 1200
+
+    req = main.ItemsRequest(entries=[main.ItemEntry(source_key="youtube:budget-test")])
+    resp = main.create_items(req, user={"id": user_id})
+    assert resp.status_code == 429, "a user already over budget should be refused a new job"
+    assert json.loads(resp.body)["error"] == "quota_exceeded"
+
+
+def test_cookie_jar_round_trips_and_survives_key_rotation():
+    import main
+    from cryptography.fernet import Fernet
+
+    user_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, f"{user_id}@example.com", "Cookie Test", db.now()),
+        )
+
+    assert main._user_cookies(user_id) is None, "no cookies configured yet"
+
+    cookie_text = "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tfoo\tbar\n"
+    encrypted = main._fernet.encrypt(cookie_text.encode())
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE users SET cookies_encrypted = ?, cookies_updated_at = ? WHERE id = ?",
+            (encrypted, db.now(), user_id),
+        )
+    assert main._user_cookies(user_id) == cookie_text
+
+    # A key rotation must degrade to "not configured", not raise — a resolve
+    # for a user whose old cookies no longer decrypt must still work for
+    # everything that isn't gated behind those cookies.
+    stale = Fernet(Fernet.generate_key()).encrypt(b"irrelevant")
+    with db.writing() as conn:
+        conn.execute("UPDATE users SET cookies_encrypted = ? WHERE id = ?", (stale, user_id))
+    assert main._user_cookies(user_id) is None
+
+
+def test_sync_returns_incremental_changes_with_a_working_cursor():
+    import main
+
+    user_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, f"{user_id}@example.com", "Sync Test", db.now()),
+        )
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING",
+            ("youtube:sync-test", "youtube", "sync-test", "http://x", db.now()),
+        )
+
+    first = main.sync(since="", user={"id": user_id})
+    assert first["items"] == [] and first["playlists"] == [] and first["playlist_items"] == []
+    cursor = first["cursor"]
+
+    item_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO library_items (id, user_id, source_key, format_profile, added_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (item_id, user_id, "youtube:sync-test", "{}", db.now(), db.now()),
+        )
+
+    second = main.sync(since=cursor, user={"id": user_id})
+    assert len(second["items"]) == 1 and second["items"][0]["id"] == item_id
+    cursor2 = second["cursor"]
+
+    third = main.sync(since=cursor2, user={"id": user_id})
+    assert third["items"] == [], "nothing changed since the second cursor"
+
+    # A tombstone is a change too, and re-syncing from the very first (empty)
+    # cursor returns full history including it — not just "current state".
+    with db.writing() as conn:
+        conn.execute(
+            "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=?",
+            (db.now(), db.now(), item_id),
+        )
+    fourth = main.sync(since=cursor2, user={"id": user_id})
+    assert len(fourth["items"]) == 1
+    assert fourth["items"][0]["deleted_at"] is not None
+
+
+def test_sync_scopes_playlist_items_by_playlist_ownership():
+    import main
+
+    owner = db.uuid7()
+    other = db.uuid7()
+    with db.writing() as conn:
+        for uid in (owner, other):
+            conn.execute(
+                "INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)",
+                (uid, f"{uid}@example.com", db.now()),
+            )
+        playlist_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (playlist_id, owner, "Owner's playlist", db.now(), db.now()),
+        )
+
+    # `other` should never see the owner's playlist in their own sync feed.
+    result = main.sync(since="", user={"id": other})
+    assert result["playlists"] == []
+
+
+def test_is_rate_limited_detects_429_messages():
+    import main
+
+    assert main._is_rate_limited("DownloadError: HTTP Error 429: Too Many Requests")
+    assert main._is_rate_limited("some 429 mid-message")
+    assert not main._is_rate_limited("HTTP Error 404: Not Found")
+
+
+def test_circuit_breaker_trips_and_backs_off_exponentially():
+    import main
+
+    main._consecutive_429s = 0
+    main._breaker_until = 0.0
+    assert main.breaker_status()["tripped"] is False
+
+    main._trip_breaker()
+    first = main.breaker_status()
+    assert first["tripped"] is True
+    assert first["consecutive_429s"] == 1
+
+    until_after_first = main._breaker_until
+    main._trip_breaker()
+    assert main._consecutive_429s == 2
+    assert main._breaker_until > until_after_first, "a second consecutive 429 should back off further"
+
+    main._reset_breaker()
+    assert main._consecutive_429s == 0
 
 
 if __name__ == "__main__":

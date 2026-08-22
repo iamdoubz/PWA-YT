@@ -55,6 +55,7 @@ async function run(store, mode, fn) {
 }
 
 export const all = (store) => run(store, 'readonly', (s) => s.getAll());
+export const get = (store, key) => run(store, 'readonly', (s) => s.get(key));
 
 /**
  * Rows arriving here are usually Svelte `$state` proxies, and neither
