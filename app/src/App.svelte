@@ -487,7 +487,7 @@
 ></audio>
 
 <main>
-  <h1>Tarmac <span class="ver">v0.2</span></h1>
+  <h1>PWA-YT <span class="ver">v0.2</span></h1>
 
   <form
     class="add"

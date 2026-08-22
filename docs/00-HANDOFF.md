@@ -1,6 +1,6 @@
 # Handoff brief
 
-**Project:** offline-first media PWA (working codename *Tarmac*)
+**Project:** PWA-YT — an offline-first media PWA
 **Status:** v0.0–v0.2 built; **device gate never run** — see `09-status.md`
 **Date:** 2026-08-21 (status updated 2026-08-22)
 **Audience:** the engineer or agent session picking this up

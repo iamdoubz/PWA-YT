@@ -7,9 +7,9 @@ dev-dist/
 app/public/media/
 
 # Server: the database is state, not source. Rebuilt by db.init().
-server/tarmac.db
-server/tarmac.db-wal
-server/tarmac.db-shm
+server/pwa-yt.db
+server/pwa-yt.db-wal
+server/pwa-yt.db-shm
 server/.venv/
 __pycache__/
 server/scratch/

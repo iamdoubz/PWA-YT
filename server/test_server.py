@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-os.environ["TARMAC_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
+os.environ["PWA_YT_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
 
 import db  # noqa: E402  (must follow the env var)
 import extract  # noqa: E402

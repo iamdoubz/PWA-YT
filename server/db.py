@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(os.environ.get("TARMAC_DB", Path(__file__).parent / "tarmac.db"))
+DB_PATH = Path(os.environ.get("PWA_YT_DB", Path(__file__).parent / "pwa-yt.db"))
 
 # v0.1 has no auth. One hardcoded user, stable across restarts so the catalogue
 # survives a server bounce. Deleted the moment passkeys land in v0.4.

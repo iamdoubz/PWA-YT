@@ -6,7 +6,7 @@
 // getAll/put/delete is ~20 lines; a dependency for that is not worth it.
 // Revisit when playlists and the outbox arrive and there is a real migration.
 
-const NAME = 'tarmac';
+const NAME = 'pwa-yt';
 const VERSION = 3;
 
 // store name -> keyPath

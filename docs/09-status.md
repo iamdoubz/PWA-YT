@@ -1,6 +1,7 @@
 # Build status
 
 **As of:** 2026-08-22 · commit `3156c5f`
+**Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2
 **Verified on:** desktop Chrome only
 
@@ -134,7 +135,7 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 ### Built but knowingly incomplete
 
 - **No migrations.** The schema is `CREATE TABLE IF NOT EXISTS`. Changing a
-  column means deleting `server/tarmac.db`. Fine now, not fine once there is
+  column means deleting `server/pwa-yt.db`. Fine now, not fine once there is
   data worth keeping — which is the moment v0.4 arrives.
 - **Artwork is read from OPFS, not mirrored into IndexedDB.** FM-7 suggests a
   blob store. Both are local so the offline property holds; revisit when a
@@ -225,12 +226,17 @@ cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```
 
-**Two traps that will cost you an hour each:**
+**Three traps that will cost you an hour each:**
 
 - **The service worker serves the previous shell** until a second load. After
   any rebuild, reload twice before believing what you see. The readiness panel
   prints the build stamp precisely so you can tell.
-- **Schema changes need `rm server/tarmac.db`.** There are no migrations.
+- **Schema changes need `rm server/pwa-yt.db`.** There are no migrations.
+- **The IndexedDB database is named `pwa-yt`.** It was `tarmac` until the
+  rename, so any browser profile that used the old build has an orphaned
+  `tarmac` database and unreferenced OPFS media under it. Clear site data for
+  the origin once and re-add your tracks; there is no migration and, pre-release
+  with a two-track test library, there should not be one.
 
 ---
 

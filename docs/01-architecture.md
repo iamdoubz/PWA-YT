@@ -94,7 +94,7 @@ to the SSE stream from memory.
 
 ## Backup and portability
 
-The entire server state is one SQLite file. `VACUUM INTO '/backup/tarmac-{date}.db'`
+The entire server state is one SQLite file. `VACUUM INTO '/backup/pwa-yt-{date}.db'`
 nightly is a complete backup. This reinforces the central thesis: if the server
 is destroyed, you lose the catalogue and job history, not a single second of
 anyone's music, because the music was never there.

@@ -171,7 +171,7 @@ claims the job, so it cannot race. Poll on an interval with jitter; do not busy-
 
 ## 4. Client — IndexedDB
 
-Database `tarmac`, version 1.
+Database `pwa-yt`, version 1.
 
 | Store | Key | Indexes | Contents |
 |---|---|---|---|

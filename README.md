@@ -1,4 +1,4 @@
-# PWA-YT  *(working codename: Tarmac)*
+# PWA-YT
 
 An offline-first progressive web app that downloads audio and video from YouTube
 and SoundCloud, stores it **on your device**, and plays it back with no network

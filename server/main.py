@@ -42,10 +42,10 @@ CANARY_EVERY_S = 6 * 60 * 60
 # extractor failure and that is a false alarm you only debug once.
 CANARY_URLS = {
     "youtube": os.environ.get(
-        "TARMAC_CANARY_YOUTUBE", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        "PWA_YT_CANARY_YOUTUBE", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     ),
     "soundcloud": os.environ.get(
-        "TARMAC_CANARY_SOUNDCLOUD", "https://soundcloud.com/bawwww/2-0-2x-1"
+        "PWA_YT_CANARY_SOUNDCLOUD", "https://soundcloud.com/bawwww/2-0-2x-1"
     ),
 }
 
@@ -53,8 +53,8 @@ _canary: dict[str, dict] = {}
 
 # Deliberately not S3. In deployment this is a size-capped tmpfs mount, so a
 # crashed process cannot leave media on a real disk.
-SCRATCH = Path(os.environ.get("TARMAC_SCRATCH", Path(__file__).parent / "scratch"))
-ORIGINS = os.environ.get("TARMAC_ORIGINS", "*").split(",")
+SCRATCH = Path(os.environ.get("PWA_YT_SCRATCH", Path(__file__).parent / "scratch"))
+ORIGINS = os.environ.get("PWA_YT_ORIGINS", "*").split(",")
 
 _resolve_pool: ProcessPoolExecutor | None = None
 _job_pool: ProcessPoolExecutor | None = None
@@ -307,7 +307,7 @@ async def lifespan(_: FastAPI):
         _job_pool.shutdown(cancel_futures=True)
 
 
-app = FastAPI(title="Tarmac", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="PWA-YT", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,

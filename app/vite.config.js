@@ -32,8 +32,8 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['icon-192.png', 'icon-512.png'],
       manifest: {
-        name: 'Tarmac',
-        short_name: 'Tarmac',
+        name: 'PWA-YT',
+        short_name: 'PWA-YT',
         start_url: '/',
         scope: '/',
         display: 'standalone',
