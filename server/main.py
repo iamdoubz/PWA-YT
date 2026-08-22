@@ -37,13 +37,17 @@ CANARY_EVERY_S = 6 * 60 * 60
 # One known-good URL per extractor. When one of these starts failing, the
 # extractor has broken upstream — which is a when, not an if. This is the early
 # warning, and it is why /health/extractors exists.
+# Metadata resolve only, no download — four requests a day per extractor.
+# Override either if the track goes away, since a deleted canary reads as an
+# extractor failure and that is a false alarm you only debug once.
 CANARY_URLS = {
     "youtube": os.environ.get(
         "TARMAC_CANARY_YOUTUBE", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     ),
+    "soundcloud": os.environ.get(
+        "TARMAC_CANARY_SOUNDCLOUD", "https://soundcloud.com/bawwww/2-0-2x-1"
+    ),
 }
-if os.environ.get("TARMAC_CANARY_SOUNDCLOUD"):
-    CANARY_URLS["soundcloud"] = os.environ["TARMAC_CANARY_SOUNDCLOUD"]
 
 _canary: dict[str, dict] = {}
 

@@ -60,7 +60,11 @@ def resolve(url: str, bitrate_kbps: int) -> dict:
             "paste a single track URL for now."
         )
 
+    # SoundCloud reports fractional seconds (62.617). The column is INTEGER and
+    # SQLite's type affinity would quietly store a REAL in it, so round here
+    # rather than letting two extractors disagree about the column's type.
     duration = info.get("duration")
+    duration = round(duration) if duration is not None else None
     return {
         "source_key": _source_key(info),
         "extractor": (info.get("extractor_key") or "").lower(),

@@ -161,10 +161,17 @@
     for (const job of data.jobs) {
       jobs[job.item_id] = job;
       errors[job.item_id] = job.state === 'failed' ? job.error : null;
-      if (job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
+      // Only pull for items this device actually has in its catalogue.
+      // /jobs returns everything the account has queued, including work started
+      // elsewhere; downloading those would write media into OPFS that no row
+      // points at, so the library never shows it and the sweep never checks it.
+      // It just silently eats the storage the user is trying to budget.
+      // Adopting other devices' items is what /sync is for, in v0.4.
+      const known = items.some((i) => i.id === job.item_id);
+      if (known && job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
         pull(job);
       }
-      if (ACTIVE.includes(job.state)) busy = true;
+      if (known && ACTIVE.includes(job.state)) busy = true;
     }
     // Idle means nothing to watch; holding the stream open would pin a server
     // thread for no reason. Any new action reopens it.
