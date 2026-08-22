@@ -492,8 +492,9 @@ def _job_json(row) -> dict:
 
 @app.get("/jobs")
 def list_jobs():
-    # ponytail: the client polls this. SSE (GET /jobs/stream) is v0.2, and it
-    # needs progress values that only exist once the worker reports them back.
+    # The client uses /jobs/stream, not this. Kept because it is the documented
+    # contract in 04-api.md and it is what you reach for with curl when the
+    # stream is misbehaving.
     with db.reading() as conn:
         rows = conn.execute(
             "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",

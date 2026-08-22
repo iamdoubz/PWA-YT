@@ -1,9 +1,14 @@
 # Handoff brief
 
 **Project:** offline-first media PWA (working codename *Tarmac*)
-**Status:** design complete, nothing built
-**Date:** 2026-08-21
-**Audience:** the engineer or agent session that will build v0.1
+**Status:** v0.0–v0.2 built; **device gate never run** — see `09-status.md`
+**Date:** 2026-08-21 (status updated 2026-08-22)
+**Audience:** the engineer or agent session picking this up
+
+> **If you are resuming work, read [`09-status.md`](09-status.md) first.** This
+> brief still describes the design correctly, but it was written before any code
+> existed. `09-status.md` says what is actually built, what is not, and which
+> acceptance gate is still open.
 
 ---
 
@@ -125,3 +130,4 @@ Prove that first. Everything in phases 0.2 through 1.0 assumes the answer is yes
 | `06-build-plan.md` | Phases with acceptance criteria |
 | `07-risks.md` | What will bite you, with mitigations |
 | `08-decisions.md` | ADR-style log of decisions already made and why |
+| `09-status.md` | **Built vs not built.** Start here when resuming. |

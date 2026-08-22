@@ -15,15 +15,20 @@ off — the app opens and plays.
 
 ## Status
 
-**v0.1 built. Not yet verified on a physical device.**
+**v0.0–v0.2 built. Not yet verified on a physical device.**
 
-The pipeline runs end to end: paste a link, see what it is and what it will cost,
-download it, and play it back with both the API and the web server switched off.
-Verified on desktop Chrome. The device test protocol in
-`docs/02-offline-playback.md` — the one that actually decides whether this works
-— has **not** been run, and the seven-day soak has not been started.
+The pipeline runs end to end for YouTube and SoundCloud: paste a link, see what
+it is and what it will cost, download it, and play it back with both the API and
+the web server switched off. Verified on desktop Chrome.
 
-Start with **[`docs/00-HANDOFF.md`](docs/00-HANDOFF.md)**, then read `CLAUDE.md`.
+The device test protocol in `docs/02-offline-playback.md` — the one that actually
+decides whether this works — has **not** been run, and the seven-day soak has not
+been started. v0.1's acceptance criteria are all device criteria and all remain
+open.
+
+**Resuming? Read [`docs/09-status.md`](docs/09-status.md) first** — built vs not
+built, known traps, and where to pick up. Then `docs/00-HANDOFF.md` and
+`CLAUDE.md`.
 
 ## Running it
 
@@ -89,6 +94,7 @@ an inconvenience rather than data loss.
 | [`docs/06-build-plan.md`](docs/06-build-plan.md) | Phases with acceptance criteria |
 | [`docs/07-risks.md`](docs/07-risks.md) | What will bite you |
 | [`docs/08-decisions.md`](docs/08-decisions.md) | Why things are the way they are |
+| [`docs/09-status.md`](docs/09-status.md) | **Built vs not built.** Start here when resuming |
 
 ## Stack
 
