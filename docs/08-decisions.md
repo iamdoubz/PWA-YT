@@ -656,3 +656,84 @@ audit every multi-statement write for whether a *later* statement inherits
 an *earlier* statement's ownership check, or needs its own — applies to
 `/sync` and anything else touching more than one table per call, and is
 worth re-running whenever a new multi-row mutation is added.
+
+---
+
+## D-022 · SSRF: restrict yt-dlp to the two supported extractor families
+
+**Status:** fixed · 2026-08-23 · found during the same hardening pass as D-021
+
+**Context.** `/resolve` and the download pipeline both hand a user-supplied
+URL straight to `yt_dlp.YoutubeDL.extract_info()`. Neither ever restricted
+*which* extractor yt-dlp is allowed to use for it. yt-dlp ships a `generic`
+extractor that activates for any URL no specific site extractor claims, and
+it will fetch that URL as a webpage — which means, unrestricted, an
+authenticated user could ask this server to fetch **any address the server
+can reach**: a cloud metadata endpoint, a service on localhost, a `file://`
+path. This app supports exactly two sources by design (D-001) — the generic
+fallback was never something the product needed, only something nobody had
+turned off.
+
+**Reproduced live before fixing**, same as D-021: `POST /resolve` with
+`http://169.254.169.254/latest/meta-data/` and with
+`http://127.0.0.1:8000/health` both resolved through the *live* server
+(before the fix) as far as yt-dlp attempting them via the generic
+extractor's normal flow — the class of request a real cloud deployment's
+metadata endpoint would answer.
+
+**Fix.** `yt_dlp.YoutubeDL`'s `allowed_extractors` param takes a list of
+regexes matched (case-insensitive, full match) against extractor names;
+`extract.ALLOWED_EXTRACTORS = ["youtube.*", "soundcloud.*"]` is set on every
+`YoutubeDL(...)` construction in both `extract.py` (resolve) and
+`pipeline.py` (download) — the restriction has to apply at *every* yt-dlp
+call site, not just the first one a URL passes through, since a URL that
+looks like YouTube at resolve time isn't re-validated before the download
+job actually runs it again. A URL outside the allowlist now fails
+`extract_info()` immediately via yt-dlp's own "no suitable extractor
+found" error, which is decided by regex-matching the URL against each
+extractor's `_VALID_URL` pattern — **no request is made** for a rejected
+URL, confirmed by both the near-instant rejection time and by aiming it at
+addresses that would otherwise be reachable and observable.
+
+**Verification.** Live, through the real running server with a real bearer
+token: a genuine YouTube URL still resolves correctly; a cloud-metadata-
+style address and a loopback address to the server's own `/health` both
+get cleanly refused with `422 resolve_failed`. A permanent regression test
+(`test_ssrf_extractor_allowlist_blocks_out_of_scope_urls`) pins the
+behavior without touching the network, since rejection happens before any
+request would be sent.
+
+**What would change this.** Adding a third supported source means adding
+its extractor name(s) to `ALLOWED_EXTRACTORS` in the same place — not
+somewhere new. If this app ever needs truly arbitrary direct-media-URL
+support (not currently a stated goal anywhere in the docs), that would need
+its own explicit, separately-considered decision — not a side effect of
+leaving the default wide open.
+
+---
+
+## D-023 · Cookie jar gets an explicit size cap
+
+**Status:** fixed · 2026-08-23 · found during the same hardening pass
+
+**Context.** `CookiesRequest.cookies` had `min_length=1` and no upper
+bound, and it's stored as a `BLOB` that gets read back and decrypted into
+memory on every resolve or download call for that user thereafter — unlike
+most request fields, this one both persists indefinitely and gets paid for
+repeatedly, not just once at request time.
+
+**Fix.** `max_length=256 * 1024` (256 KiB) — real Netscape cookie exports,
+even with hundreds of cookies, run a few KB; this leaves generous headroom
+without leaving the column truly unbounded. Verified live: a normal-sized
+cookie value still saves (`200`); a 300 KB one is rejected (`422`) before
+ever reaching the database.
+
+**Scope note, deliberately not addressed here.** This caps one field after
+Pydantic parses the body — it does not stop a request with a giant body
+from being read into memory in the first place (Starlette has no default
+global request-size limit, and none is configured). Closing that fully
+would mean a body-size-limiting layer in front of every endpoint, which is
+a materially bigger change for a threat this app's own risk register
+already prices in: R-12 explicitly keeps registration invite-only precisely
+because the user base is "the owner and people they know," not an
+adversarial public. Revisit if that scope assumption ever changes.

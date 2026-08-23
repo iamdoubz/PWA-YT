@@ -110,6 +110,21 @@ def test_source_key_is_extractor_colon_id():
     )
 
 
+def test_ssrf_extractor_allowlist_blocks_out_of_scope_urls():
+    """Security hardening, 2026-08-23 (D-022). Without `allowed_extractors`,
+    yt-dlp's generic extractor fetches *any* URL that doesn't match a known
+    site — including internal/local addresses this app has no other way to
+    reach. yt-dlp decides "no extractor matches" by testing each
+    extractor's URL pattern, which is why this rejects instantly with no
+    real network call despite using a real-looking URL."""
+    try:
+        extract.probe("https://example.com/not-a-real-video", 192)
+    except extract.ResolveError as err:
+        assert "no suitable extractor" in str(err).lower(), err
+    else:
+        raise AssertionError("a URL outside youtube/soundcloud must be rejected, not fetched")
+
+
 def test_prefer_copy_never_upscales_a_bitrate():
     import pipeline
 

@@ -1,6 +1,6 @@
 # Build status
 
-**As of:** 2026-08-23 · commit `8dee284` + uncommitted security fix (D-021)
+**As of:** 2026-08-23 · commit `372c7ee` + uncommitted hardening (D-022, D-023)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
@@ -14,10 +14,12 @@ multi-user isolation, real cross-device convergence. The one thing *not*
 verified live is completing an actual WebAuthn signature — that reaches a
 real native passkey prompt (confirmed) but needs a human at an authenticator
 to finish, same category of gap as the device test in §1.
-**A cross-account security audit on 2026-08-23 found and fixed two real
-IDOR bugs** — one account could tamper with another account's playlist
-contents despite authentication being solid throughout. See §1b and D-021
-before trusting "every endpoint requires auth" as the whole story again.
+**A security audit on 2026-08-23 found and fixed four real issues** — two
+IDOR bugs (one account could tamper with another's playlist contents
+despite authentication being solid throughout), an SSRF hole (unrestricted
+yt-dlp could be pointed at internal/local addresses), and an unbounded
+cookie-jar field. See §1b and D-021 through D-023 before trusting "every
+endpoint requires auth" as the whole story again.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -108,7 +110,7 @@ browser client against them:
   validation, session lifecycle, ceremony single-use/expiry, usage ledger
   accumulation + budget gating, cookie encrypt/decrypt + key-rotation
   degradation, circuit-breaker backoff math, sync cursor correctness and
-  ownership scoping — is pinned by `test_server.py` (20 checks, 0 failures).
+  ownership scoping — is pinned by `test_server.py` (21 checks, 0 failures).
 
 So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
 can be **without** a real passkey completing — the only piece that couldn't
@@ -160,6 +162,40 @@ where an earlier check didn't actually bound a later statement — worth
 re-auditing for the same shape whenever a new multi-row mutation is added
 (`/sync` included).
 
+**Told to keep hardening, same day:** two more findings, same live-attack
+standard (fixed and re-verified against a real running server, not just
+read from the code):
+
+- **SSRF via unrestricted `yt-dlp` extractor selection.** `/resolve` and the
+  download pipeline both hand a user's URL straight to yt-dlp with no
+  restriction on which extractor handles it — meaning yt-dlp's `generic`
+  fallback would fetch *any* unrecognised URL as a webpage. Live repro
+  (before the fix): `POST /resolve` with `http://169.254.169.254/latest/
+  meta-data/` (the shape of a cloud metadata endpoint) and with
+  `http://127.0.0.1:8000/health` (the server probing itself) both got as
+  far as yt-dlp attempting them. **Fix:** `allowed_extractors:
+  ["youtube.*", "soundcloud.*"]` on every `YoutubeDL(...)` construction in
+  both `extract.py` and `pipeline.py` — this app supports exactly two
+  sources (D-001); the generic fallback was never a feature, just an
+  unclosed default. Re-verified live: a real YouTube URL still resolves;
+  both attack URLs now fail instantly with `422 resolve_failed` and no
+  request is made (confirmed by timing and by targeting addresses that
+  would otherwise answer). See D-022.
+- **Unbounded cookie jar.** `CookiesRequest.cookies` had no upper size
+  bound, unlike every other request field it's stored *and* repeatedly
+  decrypted into memory on every future resolve/download. Capped at 256
+  KiB — real exports run a few KB. Verified live: a normal value still
+  saves (`200`); a 300 KB one is rejected (`422`) before touching the
+  database. See D-023.
+
+Not pursued in this pass, and why: a global request-body-size limit (this
+app's own risk register, R-12, already prices the user base as invite-only
+"the owner and people they know," not an adversarial public — a much
+bigger change for a threat that's explicitly out of scope); rate-limiting
+the auth ceremony endpoints (passkeys mean there is no password to
+brute-force, and invite codes carry 48 bits of entropy — not practically
+guessable regardless of rate limiting).
+
 ---
 
 ## 2. What exists
@@ -193,7 +229,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              20 checks, plain asserts, no pytest
+  test_server.py              21 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -471,6 +507,8 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-019 | Usernameless (discoverable-credential) passkeys throughout; an `invites` table 03-data-model.md never specified; WebAuthn ceremonies held in an in-memory dict, not a table |
 | D-020 | No `/sync/outbox` endpoint — pull-only `/sync` with a per-table opaque cursor; budget check is a gate not a ledger projection; cookie decrypt failures degrade silently; circuit breaker pauses claiming globally, not per-job |
 | D-021 | Two IDOR bugs found by a live cross-account audit and fixed same-day: `DELETE /items/{id}`'s playlist cascade and `PUT /playlists/{id}/items`'s upsert both lacked a same-account ownership check on the *other* row involved |
+| D-022 | SSRF: yt-dlp restricted to `allowed_extractors: ["youtube.*", "soundcloud.*"]` in both extract.py and pipeline.py — unrestricted, the generic extractor fetched any URL a user supplied, including internal/local addresses |
+| D-023 | Cookie jar capped at 256 KiB — the only request field that both persists indefinitely and gets decrypted into memory repeatedly, not just parsed once |
 
 ---
 
@@ -502,6 +540,13 @@ Each of these was invisible until something was actually run:
     endpoint's *authentication* was solid; these two specific spots'
     *authorization* wasn't. Found by a live cross-account audit request, not
     by code review — see D-021.
+11. **SSRF via yt-dlp's generic extractor** — `/resolve` and the download
+    pipeline handed a user's URL to yt-dlp with no restriction on which
+    extractor could claim it, so an unrecognised URL fell through to the
+    generic extractor and got fetched as a webpage — including internal/
+    local addresses. Found by aiming a real request at a cloud-metadata-
+    shaped address and watching it actually get attempted, not by reading
+    the code. See D-022.
 
 The pattern: every one of these came from running the thing, not from reading
 the code. Assume the same is true of whatever is built next.
@@ -529,7 +574,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 20 checks
+cd server && uv run python test_server.py    # 21 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```

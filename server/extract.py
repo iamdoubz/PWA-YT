@@ -14,6 +14,16 @@ import yt_dlp
 # Preferring an mp4a stream up front is what makes prefer_copy pay off later.
 AUDIO_FORMAT = "bestaudio[acodec^=mp4a]/bestaudio/best"
 
+# This app supports exactly two sources (D-001) — but without this, yt-dlp's
+# generic extractor happily fetches *any* URL that doesn't match a known
+# site, including internal/local addresses (cloud metadata endpoints,
+# localhost services, `file://`). That's SSRF: an authenticated user could
+# otherwise make the server fetch arbitrary network resources it can reach
+# and no user of this app could ever legitimately reach directly. Restricting
+# to the two supported extractor families closes that off at the yt-dlp
+# level rather than trying to validate URLs by hand. See D-022.
+ALLOWED_EXTRACTORS = ["youtube.*", "soundcloud.*"]
+
 
 class ResolveError(Exception):
     pass
@@ -82,6 +92,7 @@ def probe(url: str, bitrate_kbps: int, cookies_text: str | None = None) -> tuple
         "skip_download": True,
         "format": AUDIO_FORMAT,
         "extract_flat": "in_playlist",
+        "allowed_extractors": ALLOWED_EXTRACTORS,
     }
     cookie_file = None
     if cookies_text:

@@ -575,8 +575,10 @@ def me_usage(user: dict = Depends(auth.current_user)):
 
 class CookiesRequest(BaseModel):
     # Netscape cookie-file format — exactly what yt-dlp's `cookiefile` option
-    # (and browser extensions that export cookies) already produce.
-    cookies: str = Field(min_length=1)
+    # (and browser extensions that export cookies) already produce. Real
+    # exports are a few KB even with hundreds of cookies; 256 KiB is
+    # generous headroom without leaving the column an unbounded BLOB.
+    cookies: str = Field(min_length=1, max_length=256 * 1024)
 
 
 @app.put("/me/cookies")

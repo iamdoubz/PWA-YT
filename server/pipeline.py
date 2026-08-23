@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yt_dlp
 
-from extract import AUDIO_FORMAT
+from extract import ALLOWED_EXTRACTORS, AUDIO_FORMAT
 
 CHUNK = 1024 * 1024
 
@@ -177,6 +177,10 @@ def run(url: str, profile: dict, scratch_dir: str, cookies_text: str | None = No
         "outtmpl": str(scratch / "%(id)s.%(ext)s"),
         "writethumbnail": profile.get("save_artwork", True),
         "progress_hooks": [on_progress],
+        # Same SSRF restriction as extract.py's probe() — this URL already
+        # went through /resolve, but that's no reason to trust it twice as
+        # hard down here instead of enforcing it at every yt-dlp call site.
+        "allowed_extractors": ALLOWED_EXTRACTORS,
     }
     if cookies_text:
         opts["cookiefile"] = str(cookie_path)
