@@ -629,6 +629,10 @@
       // the bytes against it on the way to disk — FM-4 wants both length and
       // checksum, and length alone only catches truncation.
       files: job.files.map((f) => ({ name: f.name, url: API + f.path, sha256: f.sha256 })),
+      // The worker is a separate context with no access to api.js's
+      // module-scoped authToken — get_artifact requires a session on top of
+      // the signed per-file token, so it has to be passed in explicitly.
+      token: session?.token,
     });
   }
 

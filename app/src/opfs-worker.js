@@ -22,9 +22,13 @@ async function itemDir(itemId, create = false) {
   return (await mediaRoot(create)).getDirectoryHandle(itemId, { create });
 }
 
-async function downloadFile(dir, spec, onProgress) {
+async function downloadFile(dir, spec, onProgress, token) {
   const { name, url, sha256: expectedSha } = spec;
-  const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+  // The artifact endpoint checks the signed token AND the session — see
+  // main.py's get_artifact — so this worker, which has no access to api.js's
+  // module-scoped authToken, needs it passed in from App.svelte.
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(120_000) });
   if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
 
   const expected = Number(res.headers.get('content-length'));
@@ -84,13 +88,16 @@ async function downloadFile(dir, spec, onProgress) {
   }
 }
 
-async function download(itemId, files) {
+async function download(itemId, files, token) {
   const dir = await itemDir(itemId, true);
   const written = [];
   for (const spec of files) {
     written.push(
-      await downloadFile(dir, spec, (done, total) =>
-        self.postMessage({ type: 'progress', itemId, file: spec.name, done, total }),
+      await downloadFile(
+        dir,
+        spec,
+        (done, total) => self.postMessage({ type: 'progress', itemId, file: spec.name, done, total }),
+        token,
       ),
     );
   }
@@ -151,7 +158,11 @@ self.onmessage = async ({ data }) => {
       await purge(data.itemId);
       self.postMessage({ type: 'purged', itemId: data.itemId });
     } else {
-      self.postMessage({ type: 'done', itemId: data.itemId, files: await download(data.itemId, data.files) });
+      self.postMessage({
+        type: 'done',
+        itemId: data.itemId,
+        files: await download(data.itemId, data.files, data.token),
+      });
     }
   } catch (err) {
     self.postMessage({ type: 'error', itemId: data.itemId, error: String(err) });
