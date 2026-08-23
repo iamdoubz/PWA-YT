@@ -64,6 +64,27 @@ proxies `/api` to the server container, same as the Vite dev proxy — one
 origin, no CORS. Images also publish to `ghcr.io/<owner>/pwa-yt-{server,app}`
 via `.github/workflows/docker.yml` on every push to `main` and on version tags.
 
+### Inviting a user
+
+Registration is invite-only by design (`docs/08-decisions.md` D-008) — there
+is deliberately no signup endpoint. Minting a code is an operator action:
+
+```bash
+# Docker
+docker compose exec server uv run python scripts/create_invite.py
+
+# bare processes
+cd server && uv run python scripts/create_invite.py
+```
+
+Prints a short one-time code. In the app, click **"Have an invite code?
+Register"**, enter it plus an email and display name, then create the account
+with a passkey — `PWA_YT_RP_ID`/`PWA_YT_ORIGINS` must already match the
+hostname you're registering from (see `.env.example`) or the passkey ceremony
+fails. Every login after that is just "Sign in with a passkey," no code
+needed. Passing an existing user's id as an argument attributes the invite to
+them instead of leaving it anonymous — see the script's docstring.
+
 To test it the way it is meant to be used, put it on a phone over real HTTPS
 (`cloudflared tunnel --url http://localhost:4173`), add it to the home screen,
 then follow the protocol in `docs/02-offline-playback.md`. A localhost check with
