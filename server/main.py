@@ -6,6 +6,7 @@ SQLite calls never touch the event loop.
 
 import base64
 import json
+import multiprocessing
 import os
 import random
 import secrets
@@ -450,8 +451,16 @@ async def lifespan(_: FastAPI):
     db.init()
     SCRATCH.mkdir(parents=True, exist_ok=True)
     _sweep_orphan_scratch()
-    _resolve_pool = ProcessPoolExecutor(max_workers=2)
-    _job_pool = ProcessPoolExecutor(max_workers=RUNNERS)
+    # Forking a worker from this process is unsafe by the time these pools are
+    # first used: _runner/_canary_loop threads (started below) and FastAPI's
+    # own threadpool for sync endpoints are live by then, and fork()ing a
+    # multi-threaded process can silently deadlock a child that inherits a
+    # lock (e.g. logging's) held by some other thread at that instant — the
+    # worker never starts, .result(timeout=...) just runs out the clock with
+    # no exception. spawn sidesteps that entirely.
+    _mp = multiprocessing.get_context("spawn")
+    _resolve_pool = ProcessPoolExecutor(max_workers=2, mp_context=_mp)
+    _job_pool = ProcessPoolExecutor(max_workers=RUNNERS, mp_context=_mp)
     threads = [threading.Thread(target=_runner, daemon=True) for _ in range(RUNNERS)]
     threads.append(threading.Thread(target=_canary_loop, daemon=True))
     for t in threads:
