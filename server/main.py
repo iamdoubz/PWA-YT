@@ -464,7 +464,23 @@ async def lifespan(_: FastAPI):
         _job_pool.shutdown(cancel_futures=True)
 
 
-app = FastAPI(title="PWA-YT", version="0.1.0", lifespan=lifespan)
+# FastAPI serves interactive docs (Swagger UI, ReDoc) and the raw OpenAPI
+# schema publicly, with no auth, by default. For most APIs that's a feature;
+# for an invite-only app whose whole security posture is "a small trusted
+# group," anonymously handing out a complete, precise map of every endpoint,
+# field name, and validation rule — plus a console to try requests directly
+# from a browser — is free reconnaissance this app has no reason to offer.
+# Off by default; set PWA_YT_ENABLE_DOCS=1 for local development.
+_enable_docs = os.environ.get("PWA_YT_ENABLE_DOCS", "").lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="PWA-YT",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,

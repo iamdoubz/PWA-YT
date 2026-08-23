@@ -853,3 +853,49 @@ ever hand-parses an opaque token instead of using a typed model field.
 plus totally-undecodable input through `sync()` directly and asserts each
 returns cleanly. Also reconfirmed the original exact crash payload no
 longer reproduces, live, against the running server.
+
+---
+
+## D-027 · FastAPI's interactive docs and OpenAPI schema, public by default, are now off by default
+
+**Status:** fixed · 2026-08-23 · fifth hardening pass, same day
+
+**Context.** Checked what an anonymous, unauthenticated visitor who simply
+found the server's URL could see — a different question from "can a
+logged-out request reach someone's data," which earlier passes already
+answered. `GET /docs`, `/redoc`, and `/openapi.json` all returned `200`
+with zero authentication: FastAPI serves these by default, and nothing
+had ever turned them off. `/openapi.json` lays out the complete API
+surface — every path, every method, every request/response schema, every
+field name, every validation constraint (the exact `max_length` on
+cookies, the exact field names `invite_code`/`ceremony_id`, all of it) —
+and `/docs` is an interactive console that lets that same anonymous
+visitor construct and fire real requests at the live API directly from a
+browser.
+
+**Why this matters here specifically.** None of this grants access to any
+user's data by itself — every endpoint listed still requires a real bearer
+session to do anything, per D-021's fix. But this app's entire security
+model is invite-only, "the owner and people they know" (D-008, R-12) — not
+"secure because nobody knows the shape of the API." Handing that shape out
+free, to anyone who finds the URL, with no login at all, is reconnaissance
+this app has no reason to offer, and it's exactly the kind of thing that
+makes finding the *next* bug easier for someone who was never supposed to
+be probing this instance at all.
+
+**Fix.** `docs_url`, `redoc_url`, and `openapi_url` are all `None` unless
+`PWA_YT_ENABLE_DOCS` is set — off by default, a one-line opt-in for local
+development. Verified live: all three `404` with the env var unset; `/docs`
+returns `200` again with `PWA_YT_ENABLE_DOCS=1`. `/health` (the one
+endpoint that must stay reachable with zero configuration, for monitoring)
+is unaffected either way.
+
+**Verification.** `test_api_docs_are_disabled_by_default` asserts all three
+URLs are `None` on `app` in the default (env var unset) test environment.
+Live: confirmed `404` on all three with no env var, `200` on `/docs` with
+`PWA_YT_ENABLE_DOCS=1`, and `/health` unaffected in both cases.
+
+**What would change this.** Nothing about defaulting to off. If a real
+deployment ever wants docs reachable for a specific audience, gate them
+behind the same bearer auth everything else uses rather than making them
+unconditionally public again.

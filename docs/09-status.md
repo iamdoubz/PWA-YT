@@ -1,6 +1,6 @@
 # Build status
 
-**As of:** 2026-08-23 · commit `2b37ee6` + uncommitted hardening (D-026)
+**As of:** 2026-08-23 · commit `e7084af` + uncommitted hardening (D-027)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
@@ -14,16 +14,17 @@ multi-user isolation, real cross-device convergence. The one thing *not*
 verified live is completing an actual WebAuthn signature — that reaches a
 real native passkey prompt (confirmed) but needs a human at an authenticator
 to finish, same category of gap as the device test in §1.
-**A security audit on 2026-08-23, run in four passes, found and fixed seven
+**A security audit on 2026-08-23, run in five passes, found and fixed eight
 real issues** — two IDOR bugs (one account could tamper with another's
 playlist contents despite authentication being solid throughout), an SSRF
 hole (unrestricted yt-dlp could be pointed at internal/local addresses), an
 unbounded cookie-jar field, a circuit-breaker gap (`/resolve` didn't share
-the 429 backoff the job runner has), no security response headers, and a
-crash-on-malformed-input bug in `/sync`'s cursor. Dependency scans
+the 429 backoff the job runner has), no security response headers, a
+crash-on-malformed-input bug in `/sync`'s cursor, and a fully public,
+unauthenticated OpenAPI schema + interactive docs console. Dependency scans
 (`npm audit`, `pip-audit`), a client-side XSS/SQL-injection/CORS sweep, and
 a fuzz pass across every other endpoint's request body all came back
-clean. See §1b and D-021 through D-026 before trusting "every endpoint
+clean. See §1b and D-021 through D-027 before trusting "every endpoint
 requires auth" as the whole story again.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
@@ -115,7 +116,7 @@ browser client against them:
   validation, session lifecycle, ceremony single-use/expiry, usage ledger
   accumulation + budget gating, cookie encrypt/decrypt + key-rotation
   degradation, circuit-breaker backoff math, sync cursor correctness and
-  ownership scoping — is pinned by `test_server.py` (23 checks, 0 failures).
+  ownership scoping — is pinned by `test_server.py` (25 checks, 0 failures).
 
 So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
 can be **without** a real passkey completing — the only piece that couldn't
@@ -254,6 +255,24 @@ runs, confirmed live, no crash. The sixth didn't:
   "sync everything" for anything else — fuzzed afterward with eight
   different malformed shapes, all now return `200`. See D-026.
 
+**Told to keep auditing a fifth time** — a different question this round:
+not "can a logged-out or cross-account request reach someone's data"
+(already answered), but "what can a completely anonymous visitor who just
+found the URL see, with no login attempt at all?"
+
+- **FastAPI's `/docs`, `/redoc`, and `/openapi.json` were public, unauthenticated,
+  by default.** Confirmed live: all three returned `200` with no
+  `Authorization` header. `/openapi.json` lays out the entire API surface —
+  every path, every field name, every validation constraint — and `/docs`
+  is an interactive console for firing real requests at the live API from
+  a browser. None of this grants access to anyone's data by itself (every
+  listed endpoint still needs a real session), but this app's whole
+  security model is invite-only, "the owner and people they know" — not
+  "secure because nobody knows the API's shape." **Fixed:** all three
+  disabled unless `PWA_YT_ENABLE_DOCS` is set. Verified live: `404` on all
+  three by default, `200` on `/docs` with the env var set, `/health`
+  unaffected either way. See D-027.
+
 ---
 
 ## 2. What exists
@@ -287,7 +306,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              23 checks, plain asserts, no pytest
+  test_server.py              25 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -570,6 +589,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-024 | `/resolve` now shares the 429 circuit breaker with the job runner in both directions — a gap found by a broader sweep (deps, client XSS surface, SQL injection, CORS/WebAuthn origin handling) that otherwise came back clean |
 | D-025 | `X-Content-Type-Options: nosniff` on every response |
 | D-026 | `/sync`'s cursor crashed the endpoint (500) on a well-formed-but-wrong-shaped value — the one place client input got hand-decoded and destructured after Pydantic was done, found by fuzzing rather than reading the code |
+| D-027 | FastAPI's `/docs`, `/redoc`, `/openapi.json` were public with no auth by default — free reconnaissance for an invite-only app; now off unless `PWA_YT_ENABLE_DOCS` is set |
 
 ---
 
@@ -613,6 +633,11 @@ Each of these was invisible until something was actually run:
     raised `ValueError` instead of validating first. Found by fuzzing the
     endpoint with deliberately malformed input, the same way every other
     finding in this list was found — not by reading the code. See D-026.
+13. **`/docs`, `/redoc`, `/openapi.json` were public with zero auth** —
+    FastAPI's default, never turned off. Found by asking a different
+    question than the rest of this list: not "can a logged-out request
+    reach data" but "what can a totally anonymous visitor see with no
+    login attempt at all." See D-027.
 
 The pattern: every one of these came from running the thing, not from reading
 the code. Assume the same is true of whatever is built next.
@@ -640,7 +665,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 23 checks
+cd server && uv run python test_server.py    # 25 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```
@@ -649,6 +674,9 @@ Set `PWA_YT_COOKIE_KEY` (a Fernet key) if you want saved cookies to survive a
 restart — otherwise one is generated and printed on every startup, and
 anything encrypted under the previous run's key silently stops decrypting
 (by design, see D-020 — not a bug, but worth knowing before it looks like one).
+
+Set `PWA_YT_ENABLE_DOCS=1` if you want `/docs`/`/redoc`/`/openapi.json` —
+off by default (D-027), since this is an invite-only app, not a public API.
 
 **Four traps that will cost you an hour each:**
 

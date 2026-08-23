@@ -125,6 +125,19 @@ def test_ssrf_extractor_allowlist_blocks_out_of_scope_urls():
         raise AssertionError("a URL outside youtube/soundcloud must be rejected, not fetched")
 
 
+def test_api_docs_are_disabled_by_default():
+    """Security hardening, 2026-08-23. FastAPI serves interactive docs and
+    the raw OpenAPI schema publicly with no auth by default — free,
+    unauthenticated reconnaissance (every endpoint, field name, and
+    validation rule) this invite-only app has no reason to hand out.
+    PWA_YT_ENABLE_DOCS is unset in this test run, so all three must be off."""
+    import main
+
+    assert main.app.docs_url is None
+    assert main.app.redoc_url is None
+    assert main.app.openapi_url is None
+
+
 def test_prefer_copy_never_upscales_a_bitrate():
     import pipeline
 
