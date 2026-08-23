@@ -127,6 +127,10 @@ there was no way to fabricate a valid one without an actual authenticator.
 
 ## 1b. A cross-account security audit found two real bugs (2026-08-23), now fixed
 
+> **See `10-security-audit.md` for the checklist form of everything below**
+> — what's been audited, what hasn't, one line each. This section is the
+> narrative; that file is what to read before starting a new audit pass.
+
 Asked directly: can a logged-out or cross-account request reach someone
 else's playlist or songs? Two passes:
 

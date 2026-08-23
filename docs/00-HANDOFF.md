@@ -131,3 +131,4 @@ Prove that first. Everything in phases 0.2 through 1.0 assumes the answer is yes
 | `07-risks.md` | What will bite you, with mitigations |
 | `08-decisions.md` | ADR-style log of decisions already made and why |
 | `09-status.md` | **Built vs not built.** Start here when resuming. |
+| `10-security-audit.md` | What's been security-audited, what hasn't. Checklist, not narrative. |
