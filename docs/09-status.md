@@ -1,6 +1,6 @@
 # Build status
 
-**As of:** 2026-08-23 · commit `f14f1e0` + uncommitted hardening (D-024, D-025)
+**As of:** 2026-08-23 · commit `2b37ee6` + uncommitted hardening (D-026)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
@@ -14,15 +14,17 @@ multi-user isolation, real cross-device convergence. The one thing *not*
 verified live is completing an actual WebAuthn signature — that reaches a
 real native passkey prompt (confirmed) but needs a human at an authenticator
 to finish, same category of gap as the device test in §1.
-**A security audit on 2026-08-23, run in three passes, found and fixed six
+**A security audit on 2026-08-23, run in four passes, found and fixed seven
 real issues** — two IDOR bugs (one account could tamper with another's
 playlist contents despite authentication being solid throughout), an SSRF
 hole (unrestricted yt-dlp could be pointed at internal/local addresses), an
 unbounded cookie-jar field, a circuit-breaker gap (`/resolve` didn't share
-the 429 backoff the job runner has), and no security response headers.
-Dependency scans (`npm audit`, `pip-audit`) and a client-side XSS/
-SQL-injection/CORS sweep came back clean. See §1b and D-021 through D-025
-before trusting "every endpoint requires auth" as the whole story again.
+the 429 backoff the job runner has), no security response headers, and a
+crash-on-malformed-input bug in `/sync`'s cursor. Dependency scans
+(`npm audit`, `pip-audit`), a client-side XSS/SQL-injection/CORS sweep, and
+a fuzz pass across every other endpoint's request body all came back
+clean. See §1b and D-021 through D-026 before trusting "every endpoint
+requires auth" as the whole story again.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -113,7 +115,7 @@ browser client against them:
   validation, session lifecycle, ceremony single-use/expiry, usage ledger
   accumulation + budget gating, cookie encrypt/decrypt + key-rotation
   degradation, circuit-breaker backoff math, sync cursor correctness and
-  ownership scoping — is pinned by `test_server.py` (22 checks, 0 failures).
+  ownership scoping — is pinned by `test_server.py` (23 checks, 0 failures).
 
 So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
 can be **without** a real passkey completing — the only piece that couldn't
@@ -230,6 +232,28 @@ All of that came back clean. Two real gaps, both fixed:
   declared type. Deliberately *not* added: `X-Frame-Options`/CSP, since
   this server never serves HTML for those to protect. See D-025.
 
+**Told to keep auditing a fourth time** — this pass looked for crash-on-
+malformed-input rather than another auth gap: fuzzed six endpoints with
+wrong-typed and malformed JSON bodies. Five came back clean — every
+mutating endpoint's body is a typed Pydantic model, so garbage input
+(a string where a list was expected, a non-dict `credential`, an invalid
+literal, a non-JSON body) gets a well-formed `422` before any handler code
+runs, confirmed live, no crash. The sixth didn't:
+
+- **`GET /sync?since=` crashed with a raw `500`** on a cursor that decodes
+  cleanly as JSON but has the wrong shape — `{"items": "oops"}` instead of
+  a 2-element position, for instance. `since` is a plain `str`, decoded and
+  destructured by hand *after* Pydantic is done with the request — the one
+  place in the app that pattern exists, and exactly where the crash was.
+  Confirmed live against the running server (the server's own log showed
+  `ValueError: too many values to unpack`; the client only ever saw the
+  generic Starlette 500 text, no leaked detail — so this was a crash bug,
+  not an information-disclosure one). **Fixed:** every cursor position is
+  now read through a helper that only accepts a list of exactly the
+  expected length with every element a string, falling back to
+  "sync everything" for anything else — fuzzed afterward with eight
+  different malformed shapes, all now return `200`. See D-026.
+
 ---
 
 ## 2. What exists
@@ -263,7 +287,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              22 checks, plain asserts, no pytest
+  test_server.py              23 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -545,6 +569,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-023 | Cookie jar capped at 256 KiB — the only request field that both persists indefinitely and gets decrypted into memory repeatedly, not just parsed once |
 | D-024 | `/resolve` now shares the 429 circuit breaker with the job runner in both directions — a gap found by a broader sweep (deps, client XSS surface, SQL injection, CORS/WebAuthn origin handling) that otherwise came back clean |
 | D-025 | `X-Content-Type-Options: nosniff` on every response |
+| D-026 | `/sync`'s cursor crashed the endpoint (500) on a well-formed-but-wrong-shaped value — the one place client input got hand-decoded and destructured after Pydantic was done, found by fuzzing rather than reading the code |
 
 ---
 
@@ -583,6 +608,11 @@ Each of these was invisible until something was actually run:
     local addresses. Found by aiming a real request at a cloud-metadata-
     shaped address and watching it actually get attempted, not by reading
     the code. See D-022.
+12. **`/sync` crashed on a malformed cursor** — decoded cleanly as JSON but
+    the wrong shape (`{"items": "oops"}`), and the direct-unpack code
+    raised `ValueError` instead of validating first. Found by fuzzing the
+    endpoint with deliberately malformed input, the same way every other
+    finding in this list was found — not by reading the code. See D-026.
 
 The pattern: every one of these came from running the thing, not from reading
 the code. Assume the same is true of whatever is built next.
@@ -610,7 +640,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 22 checks
+cd server && uv run python test_server.py    # 23 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```

@@ -519,6 +519,45 @@ def test_sync_scopes_playlist_items_by_playlist_ownership():
     assert result["playlists"] == []
 
 
+def test_sync_survives_a_malformed_cursor():
+    """Security/robustness bug found live 2026-08-23: `_decode_cursor` only
+    guarded against a cursor that fails to *decode* (bad base64/JSON) — one
+    that decodes cleanly but has the wrong shape (a string instead of a
+    2-element position, wrong length, wrong element types, or not even a
+    dict at the top level) crashed the unpacking with an unhandled 500. A
+    cursor is client-supplied and should never be trusted enough to crash
+    on; every shape here must degrade to "sync everything", not raise."""
+    import base64
+    import json as json_module
+
+    import main
+
+    bad_shapes = [
+        {"items": "oops"},
+        {"items": ["a"]},  # wrong arity
+        {"items": [1, 2]},  # wrong element types
+        {"items": None},
+        {"playlist_items": ["a", "b"]},  # wrong arity (needs 3)
+        [1, 2, 3],  # not a dict at all
+        "just a string",
+        42,
+    ]
+    user_id = db.uuid7()  # fresh, not db.DEV_USER_ID — no cross-test history to confuse "did it crash?" with "what did it return?"
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)",
+            (user_id, f"{user_id}@example.com", db.now()),
+        )
+    for shape in bad_shapes:
+        cursor = base64.urlsafe_b64encode(json_module.dumps(shape).encode()).decode()
+        result = main.sync(since=cursor, user={"id": user_id})  # must not raise
+        assert result["items"] == [], f"shape {shape!r} should degrade to sync-everything, not crash"
+
+    # Undecodable-entirely still works too (the case the original fix covered).
+    result = main.sync(since="not-valid-base64-at-all!!!", user={"id": user_id})
+    assert result["items"] == []
+
+
 def test_is_rate_limited_detects_429_messages():
     import main
 

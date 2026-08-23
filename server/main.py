@@ -997,9 +997,24 @@ def _decode_cursor(raw: str) -> dict:
     if not raw:
         return {}
     try:
-        return json.loads(base64.urlsafe_b64decode(raw.encode()))
+        decoded = json.loads(base64.urlsafe_b64decode(raw.encode()))
     except Exception:
         return {}  # a corrupt/foreign cursor degrades to "sync everything", not a 500
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _cursor_position(cursor: dict, key: str, arity: int) -> tuple:
+    """A cursor is client-supplied and round-tripped opaquely — decoding
+    cleanly as JSON doesn't mean its *shape* is what this endpoint expects
+    (found live 2026-08-23: `{"items": "oops"}` decodes fine but isn't a
+    2-element position, and unpacking it crashed the whole request with an
+    unhandled 500). Anything that isn't exactly `arity` strings degrades to
+    the same "sync everything" fallback a corrupt cursor already gets,
+    rather than being trusted enough to crash on."""
+    value = cursor.get(key)
+    if isinstance(value, list) and len(value) == arity and all(isinstance(v, str) for v in value):
+        return tuple(value)
+    return ("",) * arity
 
 
 @app.get("/sync")
@@ -1007,9 +1022,9 @@ def sync(since: str = "", user: dict = Depends(auth.current_user)):
     cursor = _decode_cursor(since)
     uid = user["id"]
 
-    items_ts, items_id = cursor.get("items", ["", ""])
-    playlists_ts, playlists_id = cursor.get("playlists", ["", ""])
-    pi_ts, pi_pid, pi_iid = cursor.get("playlist_items", ["", "", ""])
+    items_ts, items_id = _cursor_position(cursor, "items", 2)
+    playlists_ts, playlists_id = _cursor_position(cursor, "playlists", 2)
+    pi_ts, pi_pid, pi_iid = _cursor_position(cursor, "playlist_items", 3)
 
     with db.reading() as conn:
         items = conn.execute(

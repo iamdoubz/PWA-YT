@@ -803,3 +803,53 @@ injected into; this server never serves HTML (the PWA shell is Vite's job,
 a separate origin in dev and a separate concern in production), so those
 headers would be ceremony here, not protection. Add them if that ever
 changes.
+
+---
+
+## D-026 · `/sync`'s cursor crashed the endpoint on a well-formed-but-wrong-shaped value
+
+**Status:** fixed · 2026-08-23 · fourth hardening pass, same day
+
+**Context.** `_decode_cursor` already guarded against a cursor that fails to
+*decode* — bad base64, invalid JSON — degrading that case to "sync
+everything" rather than a 500. It did not guard against a cursor that
+decodes perfectly cleanly but has the wrong **shape**: `sync()` immediately
+destructured each table's position with `items_ts, items_id =
+cursor.get("items", ["", ""])`, and Python happily lets that raise if the
+value isn't exactly a 2-element sequence.
+
+**Reproduced live**, the same standard as every other finding this
+session: `since={base64 of {"items": "oops"}}` against the real running
+server returned a raw `500 Internal Server Error` (confirmed via the
+server's own log: `ValueError: too many values to unpack (expected 2)` at
+the exact destructuring line). The client-facing response was the generic
+Starlette 500 text with no traceback or internal detail — so this was never
+an information-disclosure bug, but it is a real crash on client-supplied
+input, reachable by any authenticated user (not a privilege escalation,
+just malformed input where valid input was expected).
+
+**Fix.** A `_cursor_position(cursor, key, arity)` helper replaces every
+direct `cursor.get(...)` destructuring: it returns the value only if it's a
+list of exactly the expected length with every element a string, and the
+all-empty-string fallback otherwise — for *any* other shape (wrong type,
+wrong length, wrong element types, or a non-dict top level after all).
+Fuzzed live afterward with eight different malformed shapes (a bare
+string, `null`, wrong arity, wrong element types, a JSON array instead of
+an object at the top level, etc.) plus the original crash payload — all
+now return `200` and degrade to "sync everything," none crash.
+
+**Why this is the interesting one, not just another edge case.** Every
+other request field in this app is a typed Pydantic model field, so
+malformed input already gets a clean `422` before any handler code runs —
+confirmed separately by fuzzing five other endpoints (wrong types, wrong
+nesting, non-JSON bodies) and getting well-formed `422`s every time, never
+a crash. `since` is the **one** place where a client-supplied opaque value
+gets manually decoded and destructured *after* Pydantic is done — that's
+what made it different, and it's the shape to check for if anything else
+ever hand-parses an opaque token instead of using a typed model field.
+
+**Verification.** One permanent regression test
+(`test_sync_survives_a_malformed_cursor`) drives all eight malformed shapes
+plus totally-undecodable input through `sync()` directly and asserts each
+returns cleanly. Also reconfirmed the original exact crash payload no
+longer reproduces, live, against the running server.
