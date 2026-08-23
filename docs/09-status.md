@@ -1,6 +1,6 @@
 # Build status
 
-**As of:** 2026-08-22 · commit `bcfb0e3` + uncommitted v0.4 work (rest of it)
+**As of:** 2026-08-23 · commit `8dee284` + uncommitted security fix (D-021)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
@@ -14,6 +14,10 @@ multi-user isolation, real cross-device convergence. The one thing *not*
 verified live is completing an actual WebAuthn signature — that reaches a
 real native passkey prompt (confirmed) but needs a human at an authenticator
 to finish, same category of gap as the device test in §1.
+**A cross-account security audit on 2026-08-23 found and fixed two real
+IDOR bugs** — one account could tamper with another account's playlist
+contents despite authentication being solid throughout. See §1b and D-021
+before trusting "every endpoint requires auth" as the whole story again.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -104,12 +108,57 @@ browser client against them:
   validation, session lifecycle, ceremony single-use/expiry, usage ledger
   accumulation + budget gating, cookie encrypt/decrypt + key-rotation
   degradation, circuit-breaker backoff math, sync cursor correctness and
-  ownership scoping — is pinned by `test_server.py` (18 checks, 0 failures).
+  ownership scoping — is pinned by `test_server.py` (20 checks, 0 failures).
 
 So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
 can be **without** a real passkey completing — the only piece that couldn't
 be exercised this way is the cryptographic signature ceremony itself, because
 there was no way to fabricate a valid one without an actual authenticator.
+
+---
+
+## 1b. A cross-account security audit found two real bugs (2026-08-23), now fixed
+
+Asked directly: can a logged-out or cross-account request reach someone
+else's playlist or songs? Two passes:
+
+**Pass 1 — is every endpoint authenticated?** Every one of the 20
+non-public endpoints was hit with no `Authorization` header at all: all 20
+returned `401`. Reading the code confirmed why — every endpoint except
+`/health`, `/health/extractors`, and `/auth/*` takes
+`Depends(auth.current_user)`. This part was already solid.
+
+**Pass 2 — is every endpoint *authorized*, not just authenticated?** This
+is a different question, and it found two real bugs — both reproduced live
+with two real accounts (Alice and Bob, real sessions, real HTTP requests),
+not just read from the code:
+
+1. **`DELETE /items/{item_id}`** — Bob, knowing Alice's real `item_id`,
+   called delete on it. Got back `{"ok": true}`. Alice's `library_items` row
+   was correctly untouched (the query's `WHERE user_id=?` excluded it) —
+   but the playlist_items cascade added in D-018 ran regardless of whose
+   item it was, and Alice's track vanished from her own playlist.
+2. **`PUT /playlists/{id}/items`** — Bob created his own playlist, then
+   upserted Alice's real `item_id` into it. It succeeded. Only the
+   *playlist's* ownership was checked; nothing checked that the *item* being
+   attached belonged to the same account.
+
+Both are IDOR bugs (Insecure Direct Object Reference) hiding behind
+otherwise-correct authentication — the split between "who are you" (fine)
+and "are you allowed to do this to *this specific row*" (not fine, in these
+two spots). Both fixed same-day: the delete cascade now only fires when the
+caller's own delete actually matched a row; the playlist-items upsert now
+checks every `item_id` in the batch belongs to the caller before applying
+any of them. Both fixes re-verified against the same live attacks
+(now blocked) and against the legitimate same-user case (unaffected).
+Two permanent regression tests added. Full writeup: D-021.
+
+**Why these two specifically.** Every other mutating endpoint scopes its
+`WHERE user_id=?` directly on the row it writes, or checks ownership with an
+early return *before* doing anything. These two were multi-statement writes
+where an earlier check didn't actually bound a later statement — worth
+re-auditing for the same shape whenever a new multi-row mutation is added
+(`/sync` included).
 
 ---
 
@@ -144,7 +193,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              18 checks, plain asserts, no pytest
+  test_server.py              20 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -421,6 +470,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-018 | Playlist position is opaque to the server (client-only fractional indexing); the outbox replays via existing idempotent REST calls, no idempotency-key ledger |
 | D-019 | Usernameless (discoverable-credential) passkeys throughout; an `invites` table 03-data-model.md never specified; WebAuthn ceremonies held in an in-memory dict, not a table |
 | D-020 | No `/sync/outbox` endpoint — pull-only `/sync` with a per-table opaque cursor; budget check is a gate not a ledger projection; cookie decrypt failures degrade silently; circuit breaker pauses claiming globally, not per-job |
+| D-021 | Two IDOR bugs found by a live cross-account audit and fixed same-day: `DELETE /items/{id}`'s playlist cascade and `PUT /playlists/{id}/items`'s upsert both lacked a same-account ownership check on the *other* row involved |
 
 ---
 
@@ -446,6 +496,12 @@ Each of these was invisible until something was actually run:
 8. **Client pulled jobs for unknown items** — media written to OPFS that no
    library row pointed at. Invisible to the library and to the sweep.
 9. **Raw `NotFoundError` shown to the user** when a file was simply evicted.
+10. **Two IDOR bugs in the playlist endpoints** — `DELETE /items/{id}`'s
+    cascade and `PUT /playlists/{id}/items`'s upsert both trusted an id from
+    the request body without checking it belonged to the caller. Every
+    endpoint's *authentication* was solid; these two specific spots'
+    *authorization* wasn't. Found by a live cross-account audit request, not
+    by code review — see D-021.
 
 The pattern: every one of these came from running the thing, not from reading
 the code. Assume the same is true of whatever is built next.
@@ -473,7 +529,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 18 checks
+cd server && uv run python test_server.py    # 20 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```

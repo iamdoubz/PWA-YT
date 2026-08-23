@@ -164,6 +164,101 @@ def test_delete_item_cascades_into_playlists():
     assert row is not None and row["deleted_at"] is not None, "playlist_items row was not cascaded"
 
 
+def test_delete_item_does_not_touch_another_users_playlist():
+    """Security regression, found by live audit 2026-08-23 (D-021). The
+    cascade in delete_item used to run unconditionally, keyed only on
+    item_id — so calling DELETE /items/{other_user's_item_id} silently wiped
+    that item out of the *other* user's playlists, even though it correctly
+    left their library_items row untouched (the WHERE user_id=? there always
+    excluded it)."""
+    import main
+
+    owner, attacker = db.uuid7(), db.uuid7()
+    with db.writing() as conn:
+        for uid in (owner, attacker):
+            conn.execute(
+                "INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)",
+                (uid, f"{uid}@example.com", db.now()),
+            )
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING",
+            ("youtube:idor-test", "youtube", "idor-test", "http://x", db.now()),
+        )
+        item_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO library_items (id, user_id, source_key, format_profile, added_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (item_id, owner, "youtube:idor-test", "{}", db.now(), db.now()),
+        )
+        playlist_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (playlist_id, owner, "Owner's playlist", db.now(), db.now()),
+        )
+        conn.execute(
+            "INSERT INTO playlist_items (playlist_id, item_id, position, updated_at) VALUES (?,?,?,?)",
+            (playlist_id, item_id, "a0", db.now()),
+        )
+
+    main.delete_item(item_id, user={"id": attacker})  # attacker doesn't own this item
+
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT deleted_at FROM playlist_items WHERE playlist_id=? AND item_id=?",
+            (playlist_id, item_id),
+        ).fetchone()
+    assert row["deleted_at"] is None, "an attacker deleted an item out of someone else's playlist"
+
+
+def test_patch_playlist_items_rejects_another_users_item_id():
+    """Security regression, found by live audit 2026-08-23 (D-021). Only
+    playlist ownership was checked, not item ownership — so PUT
+    /playlists/{own_playlist}/items with an upsert referencing another
+    user's item_id succeeded (the FK to library_items is satisfied by
+    *any* user's row), attaching a foreign item into your own playlist."""
+    import main
+
+    owner, attacker = db.uuid7(), db.uuid7()
+    with db.writing() as conn:
+        for uid in (owner, attacker):
+            conn.execute(
+                "INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)",
+                (uid, f"{uid}@example.com", db.now()),
+            )
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING",
+            ("youtube:idor-test-2", "youtube", "idor-test-2", "http://x", db.now()),
+        )
+        owners_item = db.uuid7()
+        conn.execute(
+            "INSERT INTO library_items (id, user_id, source_key, format_profile, added_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (owners_item, owner, "youtube:idor-test-2", "{}", db.now(), db.now()),
+        )
+        attackers_playlist = db.uuid7()
+        conn.execute(
+            "INSERT INTO playlists (id, user_id, name, created_at, updated_at) VALUES (?,?,?,?,?)",
+            (attackers_playlist, attacker, "Attacker's playlist", db.now(), db.now()),
+        )
+
+    req = main.PlaylistItemsPatch(upserts=[main.PlaylistItemUpsert(item_id=owners_item, position="a0")])
+    try:
+        main.patch_playlist_items(attackers_playlist, req, user={"id": attacker})
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 404, err
+    else:
+        raise AssertionError("attaching another user's item into your own playlist must be rejected")
+
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM playlist_items WHERE playlist_id=? AND item_id=?",
+            (attackers_playlist, owners_item),
+        ).fetchone()
+    assert row is None, "the foreign item must not have been attached"
+
+
 def test_session_round_trip_and_expiry():
     import auth
 

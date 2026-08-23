@@ -803,16 +803,24 @@ def delete_item(item_id: str, user: dict = Depends(auth.current_user)):
     # Cascades into every playlist that held this item, in the same
     # transaction — otherwise a deleted item keeps a dangling playlist_items
     # row that only the UI's join hides. See D-018.
+    #
+    # Gated on `RETURNING id` actually matching a row: without this, calling
+    # delete on an item_id you don't own is a no-op for library_items (the
+    # WHERE excludes it) but the cascade below used to run unconditionally
+    # against *any* item_id regardless of whose it was — letting one account
+    # rip a track out of another account's playlist just by knowing its item
+    # id. Confirmed and fixed 2026-08-23; see 08-decisions.md D-021.
     with db.writing() as conn:
-        conn.execute(
-            "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=? AND user_id=?",
+        owned = conn.execute(
+            "UPDATE library_items SET deleted_at=?, updated_at=? WHERE id=? AND user_id=? RETURNING id",
             (db.now(), db.now(), item_id, user["id"]),
-        )
-        conn.execute(
-            "UPDATE playlist_items SET deleted_at=?, updated_at=?"
-            " WHERE item_id=? AND deleted_at IS NULL",
-            (db.now(), db.now(), item_id),
-        )
+        ).fetchone()
+        if owned:
+            conn.execute(
+                "UPDATE playlist_items SET deleted_at=?, updated_at=?"
+                " WHERE item_id=? AND deleted_at IS NULL",
+                (db.now(), db.now(), item_id),
+            )
     return {"ok": True}
 
 
@@ -902,6 +910,19 @@ def patch_playlist_items(
     reorder to one outbox row per move rather than a renumbered tail."""
     with db.writing() as conn:
         _own_playlist(conn, playlist_id, user["id"])
+        # Every upserted item_id must belong to this same user — otherwise
+        # one account could attach another account's item into their own
+        # playlist just by knowing its id (only playlist ownership was
+        # checked before; the FK to library_items is satisfied by *any*
+        # user's item). Checked as a batch, up front: fail the whole call
+        # rather than partially applying. Confirmed and fixed 2026-08-23;
+        # see 08-decisions.md D-021.
+        for u in req.upserts:
+            if not conn.execute(
+                "SELECT 1 FROM library_items WHERE id=? AND user_id=? AND deleted_at IS NULL",
+                (u.item_id, user["id"]),
+            ).fetchone():
+                raise HTTPException(404, f"No such item: {u.item_id}")
         for u in req.upserts:
             conn.execute(
                 """INSERT INTO playlist_items (playlist_id, item_id, position, updated_at, deleted_at)

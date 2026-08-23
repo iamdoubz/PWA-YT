@@ -584,3 +584,75 @@ covers it.
 **What would change this.** Pagination, the moment either `/sync` or `/jobs`
 actually gets slow at real scale. The budget-gate approximation, if daily
 overshoot from in-flight jobs ever proves to matter in practice.
+
+---
+
+## D-021 · Two IDOR bugs found by a live cross-account audit, both fixed
+
+**Status:** fixed · 2026-08-23
+
+**Context.** Asked to sanity-check that a logged-out or cross-account
+request can't reach someone else's playlist/songs. Every endpoint's
+`Depends(auth.current_user)` wiring was already right (confirmed: every
+non-public endpoint 401s with no session at all), but two endpoints had an
+**authorization** gap despite the **authentication** being solid — the
+classic split between "who are you" and "are you allowed to touch this
+specific row." Both were reproduced live with two real accounts (not just
+read from the code) before being fixed.
+
+**Bug 1 — `DELETE /items/{item_id}` let one account edit another account's
+playlist.** The playlist_items cascade added in D-018 ran unconditionally,
+keyed only on `item_id`:
+
+```python
+conn.execute("UPDATE library_items SET deleted_at=... WHERE id=? AND user_id=?", ...)
+conn.execute("UPDATE playlist_items SET deleted_at=... WHERE item_id=?", ...)  # no user check!
+```
+
+The first line correctly no-ops when you don't own the item (the `WHERE`
+excludes it). The second line doesn't care whose item it is — it fires
+regardless. Live repro: Bob, with a real session and knowing Alice's real
+`item_id`, called `DELETE /items/{alice's_item_id}`, got back `{"ok": true}`,
+and Alice's track was gone from her own playlist — while her
+`library_items` row for it was untouched, so nothing about the response
+even hinted at what had happened. **Fix:** gate the cascade on
+`RETURNING id` actually matching a row, i.e. only cascade if the caller
+genuinely owned (and thus actually deleted) the item.
+
+**Bug 2 — `PUT /playlists/{id}/items` let one account attach another
+account's item into their own playlist.** `_own_playlist` checked that the
+*playlist* belonged to the caller, but nothing checked that the *item_id* in
+each upsert did — only playlist ownership gates the call, and the FK to
+`library_items` is satisfied by any user's row, not just the caller's. Live
+repro: Bob created his own playlist, then `PUT`-upserted Alice's real
+`item_id` into it, and it succeeded — his playlist now held a foreign
+reference to her private library item. **Fix:** before applying any upserts,
+check every `item_id` in the batch belongs to the caller
+(`library_items WHERE id=? AND user_id=? AND deleted_at IS NULL`); reject
+the whole call with 404 if any doesn't, rather than partially applying.
+
+**Why these two and not others.** Every other mutating endpoint either
+scopes its own `WHERE user_id=?` directly on the row being written (safe by
+construction — a mismatched id just means 0 rows affected, e.g.
+`rename_playlist`, `delete_playlist`, `retry_job`), or gates on an ownership
+check with an early return before doing anything (safe by construction, e.g.
+`collect_artifact`'s ownership `SELECT` before its `UPDATE`). These two were
+different: multi-statement writes where an earlier statement's ownership
+check didn't actually bound a *later* statement's blast radius — the general
+shape to watch for in anything added on top of this.
+
+**Verification.** Both attacks reproduced live against real HTTP requests
+with two real accounts (not read from the code, not just unit tests), fixed,
+then re-run against the fix and confirmed blocked — Bug 1's delete now
+leaves the other account's playlist untouched, Bug 2's attach now 404s and
+attaches nothing. Legitimate same-user operations (owner deleting their own
+item and cascading correctly; owner adding their own item to their own
+playlist) re-verified unaffected. Two permanent regression tests added:
+`test_delete_item_does_not_touch_another_users_playlist`,
+`test_patch_playlist_items_rejects_another_users_item_id`.
+
+**What would change this.** Nothing about the fix. The general lesson —
+audit every multi-statement write for whether a *later* statement inherits
+an *earlier* statement's ownership check, or needs its own — applies to
+`/sync` and anything else touching more than one table per call, and is
+worth re-running whenever a new multi-row mutation is added.
