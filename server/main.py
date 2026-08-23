@@ -473,6 +473,18 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    """Cheap, standard, no-downside hardening on every response. Most
+    relevant to /jobs/{id}/artifact/{filename}: it already sets an explicit
+    media_type, but nosniff means a browser given a direct artifact link
+    can never be talked into treating it as something else — e.g. HTML —
+    based on sniffing the bytes instead of trusting the declared type."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(_, exc: HTTPException):
     """auth.py (and anything else) raises plain HTTPException; this reshapes
@@ -659,7 +671,23 @@ def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
     committing anything to their phone. A single item comes back as one JSON
     object; a playlist streams as NDJSON so entries appear as they're enumerated
     rather than all at once after a 400-entry wait.
+
+    This shares the circuit breaker with the job runner (R-10): resolving also
+    reaches the shared server IP, so a 429 here is the same signal a 429
+    mid-download is, and the reverse — if the breaker is already tripped from
+    a download job's 429, hammering /resolve while it cools down would just
+    make that worse. Neither path should be the one that doesn't know about
+    the other.
     """
+    breaker = breaker_status()
+    if breaker["tripped"]:
+        return error(
+            503,
+            "rate_limited",
+            "Temporarily backing off after a rate limit from the source site. Try again shortly.",
+            retry_after_s=breaker["retry_after_s"],
+        )
+
     try:
         kind, payload = _resolve_pool.submit(
             extract.probe, req.url, req.format_profile.audio_bitrate, _user_cookies(user["id"])
@@ -672,7 +700,11 @@ def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
             "The site may be slow or blocking us; try again in a minute.",
         )
     except extract.ResolveError as err:
+        if _is_rate_limited(str(err)):
+            _trip_breaker()
         return error(422, "resolve_failed", str(err))
+
+    _reset_breaker()  # a successful resolve is proof the shared IP isn't blocked right now
 
     if kind == "item":
         _upsert_source(payload)

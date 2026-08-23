@@ -1,6 +1,6 @@
 # Build status
 
-**As of:** 2026-08-23 · commit `372c7ee` + uncommitted hardening (D-022, D-023)
+**As of:** 2026-08-23 · commit `f14f1e0` + uncommitted hardening (D-024, D-025)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
@@ -14,12 +14,15 @@ multi-user isolation, real cross-device convergence. The one thing *not*
 verified live is completing an actual WebAuthn signature — that reaches a
 real native passkey prompt (confirmed) but needs a human at an authenticator
 to finish, same category of gap as the device test in §1.
-**A security audit on 2026-08-23 found and fixed four real issues** — two
-IDOR bugs (one account could tamper with another's playlist contents
-despite authentication being solid throughout), an SSRF hole (unrestricted
-yt-dlp could be pointed at internal/local addresses), and an unbounded
-cookie-jar field. See §1b and D-021 through D-023 before trusting "every
-endpoint requires auth" as the whole story again.
+**A security audit on 2026-08-23, run in three passes, found and fixed six
+real issues** — two IDOR bugs (one account could tamper with another's
+playlist contents despite authentication being solid throughout), an SSRF
+hole (unrestricted yt-dlp could be pointed at internal/local addresses), an
+unbounded cookie-jar field, a circuit-breaker gap (`/resolve` didn't share
+the 429 backoff the job runner has), and no security response headers.
+Dependency scans (`npm audit`, `pip-audit`) and a client-side XSS/
+SQL-injection/CORS sweep came back clean. See §1b and D-021 through D-025
+before trusting "every endpoint requires auth" as the whole story again.
 
 Read this with `06-build-plan.md` open. This file says what is *actually* true;
 the build plan says what was *supposed* to happen.
@@ -110,7 +113,7 @@ browser client against them:
   validation, session lifecycle, ceremony single-use/expiry, usage ledger
   accumulation + budget gating, cookie encrypt/decrypt + key-rotation
   degradation, circuit-breaker backoff math, sync cursor correctness and
-  ownership scoping — is pinned by `test_server.py` (21 checks, 0 failures).
+  ownership scoping — is pinned by `test_server.py` (22 checks, 0 failures).
 
 So: acceptance criterion v0.4-1 (and -3, -4) are about as verified as they
 can be **without** a real passkey completing — the only piece that couldn't
@@ -196,6 +199,37 @@ the auth ceremony endpoints (passkeys mean there is no password to
 brute-force, and invite codes carry 48 bits of entropy — not practically
 guessable regardless of rate limiting).
 
+**Told to keep going a third time, same day** — a broader sweep rather than
+another targeted attack: `npm audit` on the client (406 packages, 0
+vulnerabilities), `pip-audit` on the server via a temporary `uv export`
+(0 vulnerabilities), a client-side review for XSS sinks (no `@html`,
+`innerHTML`, or `eval` anywhere in `app/src`; `thumb_url` is never even
+referenced client-side, so FM-7 holds structurally, not just by habit;
+every `<img>` binds only to a local blob URL, never a remote one), a
+SQL-injection sweep (every query in the codebase is parameterized — no
+query is ever built with an f-string or `.format()`), and a re-check that
+CORS/WebAuthn origin handling can't quietly degrade to "accept anything"
+(confirmed: `auth.py` strips `*` before it could ever reach
+`expected_origin`; `allow_credentials` is never set on the CORS
+middleware, so main.py's separate wildcard CORS default never combines
+with credentialed requests the way it would need to for that to matter).
+All of that came back clean. Two real gaps, both fixed:
+
+- **The 429 circuit breaker only covered the job runner, not `/resolve`.**
+  Resolving reaches the same shared server IP a download does — a 429 from
+  a resolve is the same signal, and an already-tripped breaker gave
+  `/resolve` no reason to back off either. Fixed: `resolve()` now checks
+  the breaker before submitting anything (returns `503 rate_limited`,
+  no request attempted, if already tripped), trips it on a rate-limited
+  `ResolveError`, and resets it on success — same shared state, both call
+  sites now participate. See D-024.
+- **No security response headers at all.** Added
+  `X-Content-Type-Options: nosniff` on every response via one middleware —
+  most relevant to the artifact download endpoint, so a browser can never
+  be talked into MIME-sniffing a served file as something other than its
+  declared type. Deliberately *not* added: `X-Frame-Options`/CSP, since
+  this server never serves HTML for those to protect. See D-025.
+
 ---
 
 ## 2. What exists
@@ -229,7 +263,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              21 checks, plain asserts, no pytest
+  test_server.py              22 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -509,6 +543,8 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-021 | Two IDOR bugs found by a live cross-account audit and fixed same-day: `DELETE /items/{id}`'s playlist cascade and `PUT /playlists/{id}/items`'s upsert both lacked a same-account ownership check on the *other* row involved |
 | D-022 | SSRF: yt-dlp restricted to `allowed_extractors: ["youtube.*", "soundcloud.*"]` in both extract.py and pipeline.py — unrestricted, the generic extractor fetched any URL a user supplied, including internal/local addresses |
 | D-023 | Cookie jar capped at 256 KiB — the only request field that both persists indefinitely and gets decrypted into memory repeatedly, not just parsed once |
+| D-024 | `/resolve` now shares the 429 circuit breaker with the job runner in both directions — a gap found by a broader sweep (deps, client XSS surface, SQL injection, CORS/WebAuthn origin handling) that otherwise came back clean |
+| D-025 | `X-Content-Type-Options: nosniff` on every response |
 
 ---
 
@@ -574,7 +610,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 21 checks
+cd server && uv run python test_server.py    # 22 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```

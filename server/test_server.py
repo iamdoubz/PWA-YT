@@ -546,6 +546,31 @@ def test_circuit_breaker_trips_and_backs_off_exponentially():
 
     main._reset_breaker()
     assert main._consecutive_429s == 0
+    main._breaker_until = 0.0  # don't leak a tripped breaker into other tests
+
+
+def test_resolve_short_circuits_when_the_breaker_is_tripped():
+    """Hardening, 2026-08-23: /resolve reaches the same shared server IP the
+    job runner does, so it shares the circuit breaker in both directions —
+    a 429 from a resolve trips it, and an already-tripped breaker should
+    stop /resolve from hammering the source while it's cooling down. This
+    checks the short-circuit specifically: it returns before ever touching
+    the resolve pool, so it needs no running server or pool to test."""
+    import main
+
+    main._consecutive_429s = 0
+    main._breaker_until = 0.0
+    main._trip_breaker()
+    try:
+        resp = main.resolve(
+            main.ResolveRequest(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            user={"id": db.DEV_USER_ID},
+        )
+        assert resp.status_code == 503
+        assert json.loads(resp.body)["error"] == "rate_limited"
+    finally:
+        main._reset_breaker()
+        main._breaker_until = 0.0
 
 
 if __name__ == "__main__":

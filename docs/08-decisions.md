@@ -737,3 +737,69 @@ a materially bigger change for a threat this app's own risk register
 already prices in: R-12 explicitly keeps registration invite-only precisely
 because the user base is "the owner and people they know," not an
 adversarial public. Revisit if that scope assumption ever changes.
+
+---
+
+## D-024 · The circuit breaker now covers `/resolve`, not just downloads; a broad sweep found nothing else
+
+**Status:** fixed · 2026-08-23 · third hardening pass, same day
+
+**Context.** Continued the audit past the two IDOR bugs and SSRF: dependency
+vulnerability scan (client `npm audit`, server `pip-audit` via a temporary
+`uv export`), a client-side review (no `@html`/`innerHTML`/`eval` anywhere;
+`thumb_url` is never even referenced client-side, so FM-7 holds by
+construction, not by discipline; every `<img>` binds only to a local blob
+URL), a SQL-injection sweep (every query across the codebase is
+parameterized — no f-string or `.format()` ever builds a query string), and
+a re-check that CORS/WebAuthn origin handling can't degenerate to
+effectively no origin check (confirmed: `auth.py` filters `*` out before it
+could ever reach `expected_origin`, and `allow_credentials` is never set,
+so main.py's separate CORS wildcard default doesn't combine with credentialed
+requests the way it would need to for that to matter). All of that came back
+clean — one real gap found:
+
+**Gap: the 429 circuit breaker (R-10, D-020) only wrapped the job runner.**
+`/resolve` reaches the same shared server IP `pipeline.run` does — a 429
+from a resolve is the same signal a 429 mid-download is, and neither
+direction knew about the other. A resolve could get rate-limited without
+ever tripping the breaker the download path relies on, and — worse — once
+the breaker *was* tripped by a download job, `/resolve` had no way to know
+and would keep hammering the source right through the cooldown.
+
+**Fix.** `resolve()` now checks `breaker_status()` before submitting
+anything to the resolve pool, returning `503 rate_limited` with
+`retry_after_s` if already tripped — no request is even attempted while
+cooling down. A `ResolveError` whose message matches `_is_rate_limited`
+trips the breaker exactly like a job failure does; a successful resolve
+resets it exactly like a successful job does. Same breaker, same state,
+both call sites now participate symmetrically.
+
+**Verification.** Unit test drives the exact short-circuit path directly
+(trips the breaker, calls `resolve()`, confirms `503` before the resolve
+pool would ever be touched — this needs no running pool to test, since the
+check happens first). Live: confirmed a normal resolve still succeeds
+through the real server when untripped, and `/health/extractors`'
+`circuit_breaker` field reads correctly either way.
+
+---
+
+## D-025 · `X-Content-Type-Options: nosniff` on every response
+
+**Status:** fixed · 2026-08-23 · same pass
+
+**Context.** No security response headers were set anywhere. Most relevant
+to `/jobs/{id}/artifact/{filename}`, which already sets an explicit
+`media_type` — `nosniff` means a browser handed a direct artifact link
+can never be talked into MIME-sniffing the bytes as something other than
+what was declared.
+
+**Fix.** One `@app.middleware("http")` sets the header on every response,
+success or error. Confirmed live with a raw request against the running
+server.
+
+**Scope note.** Deliberately just this one header. `X-Frame-Options`/CSP
+matter for surfaces that render HTML in a way that can be framed or
+injected into; this server never serves HTML (the PWA shell is Vite's job,
+a separate origin in dev and a separate concern in production), so those
+headers would be ceremony here, not protection. Add them if that ever
+changes.
