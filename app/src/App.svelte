@@ -815,15 +815,25 @@
   // never waiting on OPFS when playback reaches it.
   function play(item, playlistId = null) {
     const url = urls[item.id]?.audio;
-    if (!url) return;
-    // Everything here is synchronous so the iOS gesture still counts.
+    if (!url) {
+      errors[item.id] = 'No local copy to play — try "Check my library" or re-download.';
+      return;
+    }
+    errors[item.id] = null;
+    // Everything here is synchronous so the iOS gesture still counts. The
+    // .catch below is fire-and-forget on purpose — attaching it doesn't
+    // un-synchronise the play() call itself, it just stops a rejection
+    // (autoplay policy, an unsupported source) from vanishing as a silent,
+    // unhandled promise rejection with nothing shown on screen.
     if (playingId !== item.id) {
       audio.src = url;
       playingId = item.id;
       queuePlaylistId = playlistId;
       setMetadata(item);
     }
-    audio.play();
+    audio.play().catch((err) => {
+      errors[item.id] = `Playback failed: ${err.name} — ${err.message}`;
+    });
   }
 
   function stop() {
@@ -939,6 +949,15 @@
     pushPositionState();
   }}
   onended={() => step(1)}
+  onerror={() => {
+    // Some failures (an unsupported codec/container, in particular) surface
+    // here rather than as a play() rejection — play() can have already
+    // resolved by the time decoding actually fails.
+    const codes = { 1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
+    if (playingId && audio.error) {
+      errors[playingId] = `Playback failed: ${codes[audio.error.code] ?? audio.error.code}`;
+    }
+  }}
 ></audio>
 
 <main>
