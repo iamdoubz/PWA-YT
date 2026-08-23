@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+scratch/
+pwa-yt.db
+pwa-yt.db-wal
+pwa-yt.db-shm
+test_server.py

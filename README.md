@@ -50,6 +50,20 @@ cd server && uv run python test_server.py   # server self-check
 cd app && npm run check:no-cdn              # fails if the shell gained a CDN reference
 ```
 
+### Docker
+
+Two containers, one volume (`docs/01-architecture.md`), `linux/amd64` only.
+
+```bash
+cp .env.example .env   # then edit it
+docker compose up -d --build
+```
+
+The app container serves the built PWA on `$APP_PORT` (default `8080`) and
+proxies `/api` to the server container, same as the Vite dev proxy — one
+origin, no CORS. Images also publish to `ghcr.io/<owner>/pwa-yt-{server,app}`
+via `.github/workflows/docker.yml` on every push to `main` and on version tags.
+
 To test it the way it is meant to be used, put it on a phone over real HTTPS
 (`cloudflared tunnel --url http://localhost:4173`), add it to the home screen,
 then follow the protocol in `docs/02-offline-playback.md`. A localhost check with
