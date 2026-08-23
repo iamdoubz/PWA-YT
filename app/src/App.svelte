@@ -682,6 +682,10 @@
   const roleOf = (name) =>
     name.startsWith('audio') ? 'audio' : name.startsWith('art-sq') ? 'art' : 'art-full';
 
+  // Matched against whatever precedes a possible ".part" suffix, since a
+  // device where OPFS move() is unsupported never drops it — see resolveUrls.
+  const mimeFor = (name) => (name.includes('.mp3') ? 'audio/mpeg' : 'audio/mp4');
+
   async function onWorkerMessage({ data }) {
     if (data.type === 'progress') {
       progress[data.itemId] = data.done / data.total;
@@ -753,7 +757,17 @@
       const dir = await (await root.getDirectoryHandle('media')).getDirectoryHandle(row.item_id);
       for (const f of row.files) {
         try {
-          next[f.role] = URL.createObjectURL(await (await dir.getFileHandle(f.name)).getFile());
+          const file = await (await dir.getFileHandle(f.name)).getFile();
+          // The File's own .type is whatever the platform infers from the
+          // filename — and when OPFS move() is unsupported (confirmed on at
+          // least one real iOS Safari), the file stays under its .part name
+          // forever, so that inference comes back empty. Safari's <audio>,
+          // unlike Chrome, trusts the blob's declared type rather than
+          // sniffing content, and a blob URL with no type reliably fails as
+          // MEDIA_ERR_SRC_NOT_SUPPORTED. Re-wrapping with an explicit type
+          // does not copy the bytes — Blob-from-Blob is a lazy reference.
+          const blob = f.role === 'audio' ? new Blob([file], { type: mimeFor(f.name) }) : file;
+          next[f.role] = URL.createObjectURL(blob);
         } catch {
           /* that one file is gone; the sweep is what records it */
         }
