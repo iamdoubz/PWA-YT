@@ -445,12 +445,36 @@ def _sweep_orphan_scratch() -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
+def _reap_missing_artifacts() -> None:
+    """The mirror image of _sweep_orphan_scratch: a 'ready' job whose scratch
+    directory is gone. Scratch is tmpfs (docs/01-architecture.md) — it does
+    not survive a container restart, but the DB row does, so a job finished
+    right before a restart is stuck 'ready' pointing at nothing. Left alone,
+    every download attempt just 404s forever with no signal to retry."""
+    with db.reading() as conn:
+        rows = conn.execute(
+            "SELECT id, artifact_path FROM jobs WHERE state='ready' AND artifact_path IS NOT NULL"
+        ).fetchall()
+    stale = [r["id"] for r in rows if not Path(r["artifact_path"]).exists()]
+    if not stale:
+        return
+    with db.writing() as conn:
+        conn.executemany(
+            """UPDATE jobs SET state='failed', error=?, artifact_path=NULL,
+                               artifact_token=NULL, artifact_manifest=NULL,
+                               updated_at=? WHERE id=?""",
+            [("Artifact lost in a server restart. Retry the job.", db.now(), job_id)
+             for job_id in stale],
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _resolve_pool, _job_pool
     db.init()
     SCRATCH.mkdir(parents=True, exist_ok=True)
     _sweep_orphan_scratch()
+    _reap_missing_artifacts()
     # Forking a worker from this process is unsafe by the time these pools are
     # first used: _runner/_canary_loop threads (started below) and FastAPI's
     # own threadpool for sync endpoints are live by then, and fork()ing a
