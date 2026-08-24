@@ -20,6 +20,9 @@ const ALLOW = [
   // @simplewebauthn/browser's console.warn() for the pre-v9 calling
   // convention, which this app doesn't use (always calls with `{ optionsJSON }`).
   /^https:\/\/simplewebauthn\.dev\/docs\//,
+  // Account sheet footer: a plain <a href> the user clicks, not a resource the
+  // shell fetches — never touched by the offline boot or playback path.
+  /^https:\/\/github\.com\/iamdoubz\/PWA-YT$/,
 ];
 
 const walk = (dir) =>
