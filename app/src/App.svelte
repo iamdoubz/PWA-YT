@@ -884,11 +884,18 @@
   }
 
   async function redownload(item) {
+    if (jobs[item.id] && ACTIVE.includes(jobs[item.id].state)) return;
     errors[item.id] = null;
+    // Optimistic: server-side jobs are never deduped against an already-active
+    // one for this item (see D-028), so nothing but this stops a second click
+    // landing before the real "queued" job comes back over the stream and
+    // creating its own duplicate download.
+    jobs[item.id] = { state: 'queued' };
     try {
       await api.createItem(item.source_key, $state.snapshot(profile));
       startPolling();
     } catch (err) {
+      delete jobs[item.id];
       errors[item.id] = err.message;
     }
   }
