@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("PWA_YT_DB", Path(__file__).parent / "pwa-yt.db"))
@@ -166,11 +166,34 @@ CREATE INDEX IF NOT EXISTS ix_pli_order ON playlist_items(playlist_id, position)
 _writer: sqlite3.Connection | None = None
 _write_lock = threading.Lock()
 
+_now_lock = threading.Lock()
+_last_now: datetime | None = None
+
 
 def now() -> str:
     """ISO 8601 UTC, milliseconds, Z suffix. Sorts lexicographically, which is
-    the property the sync cursor depends on."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    the property the sync cursor depends on.
+
+    Monotonic within the process: two calls landing in the same wall-clock
+    millisecond — routine on fast hardware, and easy to hit when a row is
+    written twice in a row, e.g. `_finish`'s backfill touching a
+    `library_items` row a caller just wrote — must still sort strictly, or
+    the second write ties `/sync`'s `(updated_at, id) > cursor` comparison
+    instead of beating it and a device's next sync silently misses it.
+    """
+    global _last_now
+    with _now_lock:
+        ts = datetime.now(timezone.utc)
+        # Truncate to millisecond precision *before* comparing — two distinct
+        # wall-clock reads a few microseconds apart still round-trip through
+        # isoformat(timespec="milliseconds") to the same string, so comparing
+        # at full precision would miss exactly the collision this exists to
+        # catch.
+        ts = ts.replace(microsecond=(ts.microsecond // 1000) * 1000)
+        if _last_now is not None and ts <= _last_now:
+            ts = _last_now + timedelta(milliseconds=1)
+        _last_now = ts
+        return ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def uuid7() -> str:
