@@ -2705,6 +2705,14 @@
     appearance: none;
     -webkit-appearance: none;
     height: 6px;
+  }
+  /* The fill has to live on the track pseudo-element, not the input's own
+     background — the input's box includes the 24px padding above, but the
+     thumb only ever travels the track's (padding-less) width, so a gradient
+     on the input itself put the fill and the thumb on two different scales
+     and they drifted apart as the track got longer. */
+  .scrubber::-webkit-slider-runnable-track {
+    height: 6px;
     border-radius: 999px;
     background: linear-gradient(to right, var(--accent) var(--pct, 0%), var(--border) var(--pct, 0%));
   }
@@ -2714,7 +2722,7 @@
     height: 16px;
     border-radius: 50%;
     background: var(--text);
-    margin-top: 0;
+    margin-top: -5px;
   }
   .scrubber::-moz-range-thumb {
     width: 16px;
@@ -2727,6 +2735,12 @@
     height: 6px;
     border-radius: 999px;
     background: var(--border);
+  }
+  /* Firefox has a real fill primitive — no gradient math needed here. */
+  .scrubber::-moz-range-progress {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--accent);
   }
   .scrubber:focus-visible {
     outline: 2px solid var(--accent);
