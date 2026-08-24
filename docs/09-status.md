@@ -707,29 +707,57 @@ off by default (D-027), since this is an invite-only app, not a public API.
 
 ## 7. Where to pick up
 
-v0.4 is code-complete. What's left is verification that needs a human, plus
-v1.0. In the order I would actually do them:
+**Update, 2026-08-23 — steps 1 and 2 below are now underway on real hardware,
+and step 1 surfaced a critical finding.** Docker deployment now exists
+(`docker-compose.yml`, GHCR images, GitHub Actions) and was used to run this
+testing behind a real domain rather than a cloudflared tunnel. Passkey
+registration and login both completed successfully on an iPhone. Several real
+bugs surfaced and were fixed along the way: the resolve-job process pool could
+deadlock forking from an already-threaded process; the OPFS download worker
+never sent its session token (401s on every artifact download); nginx's
+static-asset caching regex was intercepting `/api/.../art.jpg` before it
+reached the proxy; a job whose tmpfs scratch was lost to a server restart
+404'd forever instead of surfacing as retryable; iOS Safari refused to play
+audio from a `.part`-named OPFS file because the inferred blob MIME type came
+back empty; and a fresh login never re-triggered `/sync`, so a device that
+lost its local storage stayed at "0 items" even though the server still had
+everything. All fixed on `main`.
 
-1. **Start the device clock.** Tunnel (`cloudflared tunnel --url
-   http://localhost:4173` — a **named** tunnel now, see the fourth trap in §6),
-   add to the iPhone home screen, download two tracks, force-quit, leave it
-   alone with the device low on free space. Five minutes of work; it starts
-   the only test that cannot be hurried. Still true, still not done — every
-   phase since v0.1 was built on top of the same risk position.
-2. **Complete a real passkey registration.** The one thing in all of v0.4
-   that needs a human, not more code — open the app on an actual device or
-   desktop Chrome with Windows Hello / Touch ID set up, mint an invite
-   (`uv run python scripts/create_invite.py`), and register. Everything up to
-   the native prompt is verified (§1a); this is the last unverified step, and
-   completing it with a *second* real account would let assertion v0.4-1
-   move from "verified with seeded sessions" to "verified with the actual
-   passkey flow a real user goes through."
-3. **Run the offline protocol** — `02-offline-playback.md` §5, all 14
-   assertions. The readiness panel reports `persist()`, OPFS `move()`, and
-   the fetch counter directly on screen, so most assertions are readable
-   without a debugger. The two genuinely unknown answers are whether
-   `persist()` returns true and whether Safari supports OPFS `move()`. This
-   now also needs step 2 done first, since the library only renders signed in.
+**The critical finding: read R-2 in `07-risks.md` in full before continuing.**
+On the same iPhone, with the app added to the home screen and `persist()`
+previously reporting `granted`, the entire origin's storage (session,
+catalogue, *and* downloaded media together) was wiped after only a few hours
+of the app sitting closed-from-RAM while Instagram Reels was used elsewhere —
+no low-storage warning, plenty of free space. `persist()` now reads `DENIED`.
+This is a full-origin wipe, not the one-file-at-a-time LRU eviction this
+section originally assumed, and it happened in hours, not the 7-day window
+most iOS storage writeups describe. Confirmed against WebKit's own storage
+policy docs as a real, known-possible platform behavior (storage-pressure
+eviction, independent of the 7-day timer), not an app bug — see R-2 for the
+sources and the mitigations applied so far (neither of which fixes the
+underlying behavior).
+
+**What's still open, and it's the load-bearing question for this whole
+project:** is this reliably reproducible, what actually triggers it, and —
+critically — can it happen *mid-flight*, with no network to re-download from?
+That last one is the actual scenario `CLAUDE.md` cares about; losing a
+download while sitting at a desk with wifi is an inconvenience, losing it at
+35,000 feet is the failure this whole design exists to prevent. Needs a
+controlled repro before concluding whether D-002's "eviction is an
+inconvenience, not data loss" framing still holds, or whether the offline
+architecture needs revisiting.
+
+Original plan, still relevant for what's left:
+
+1. ~~Start the device clock~~ — done; see above. The 7-day soak this was meant
+   to start is now more urgent, not less, given what step 1 turned up early.
+2. ~~Complete a real passkey registration~~ — done, on a real iPhone.
+3. **Run the rest of the offline protocol** — `02-offline-playback.md` §5, all
+   14 assertions. Playback, lock-screen controls, and OPFS `move()` (confirmed
+   **unsupported** on this device, handled via the documented `.part` fallback)
+   are now verified. The storage-eviction assertions are the ones that matter
+   most now — go in expecting the answer might be "no" and design the
+   controlled repro accordingly.
 4. **v1.0**, when it's time: video (`keep_video`), muxing, a video view,
    optional `ffmpeg.wasm` client transcode behind COEP, nightly
    `VACUUM INTO` backups.
@@ -737,7 +765,8 @@ v1.0. In the order I would actually do them:
    alone have been enough to build and test everything so far. Add it when
    someone actually needs the recovery path, not before.
 
-If step 1 fails — media does not survive on the device — stop and re-read
+If the storage-eviction repro comes back reliably bad — media does not survive
+ordinary backgrounded use even with `persist()` granted — stop and re-read
 `02-offline-playback.md` §2 before writing any more code. That is the scenario
-the phase ordering existed to catch early, and it would still be much cheaper
-to find out now than after v1.0.
+the phase ordering existed to catch early, and it is still much cheaper to
+find out now than after v1.0.

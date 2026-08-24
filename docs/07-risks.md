@@ -18,6 +18,45 @@ The library renders, the file is gone, playback fails with an opaque error.
 one-tap re-download. Never let a play attempt be the thing that discovers the
 file is absent. `02-offline-playback.md` FM-6.
 
+**CRITICAL — confirmed on real hardware, worse than the model above (2026-08-23).**
+During v0.1 device testing (iPhone, added to home screen, `navigator.storage
+.persist()` had reported `granted`), the app was closed from RAM and the phone
+was used normally for a few hours — the one thing running was Instagram Reels,
+which is known to cache large amounts of video. On reopening PWA-YT: the entire
+origin's storage was gone — not just OPFS media, but IndexedDB too (session
+*and* catalogue), and "Persistent storage" now read **DENIED**. No low-storage
+warning, no reboot, no OS update, ~41 GB free reported shortly before.
+
+This is not the LRU-one-file-at-a-time eviction R-2 was written to describe —
+it's a full-origin wipe, and it happened in hours, not the 7-day non-interaction
+window most iOS storage-eviction writeups describe (that specific ITP timer
+resets on home-screen-app use and isn't what fired here). Per WebKit's own
+"[Updates to Storage Policy](https://webkit.org/blog/14403/updates-to-storage-policy/)"
+post, eviction is independently triggered by "the system is under storage
+pressure" — a separate condition from the 7-day timer — and a `persist()` grant
+only makes an origin *less likely* to be picked, via heuristics, not exempt.
+**`navigator.storage.persist()` returning `true` is not the durable guarantee
+its name implies on iOS Safari.**
+
+Mitigated so far, neither of which fixes the underlying platform behavior:
+- `App.svelte` now calls `persist()` on every boot, not only after a download,
+  so the app at least keeps re-asking rather than silently staying unprotected
+  once revoked.
+- A fresh login now re-triggers `reconcile()` (full `/sync` pull), so losing
+  local storage costs a re-download of media, not the appearance of a wiped
+  account — the catalogue metadata comes back immediately since the server
+  never lost it (D-002).
+
+**Not yet answered, and load-bearing for whether the current design holds:**
+is this reliably reproducible (same conditions, same result), what specifically
+triggers it (another app's storage/video-cache pressure vs. elapsed backgrounded
+time vs. something else), and does it also happen mid-flight with no network to
+re-download from — which would be the actual failure the whole project is built
+to avoid. Needs a controlled repro (grant persist, download, force-quit, run a
+video-heavy app for a set interval, reopen and check) before concluding whether
+this is "an inconvenience" (D-002's framing) or something that requires
+revisiting the architecture per `CLAUDE.md`.
+
 ## R-3 · Partial files that look complete
 
 A track plays for forty seconds and stops. On a plane. This is the bug that
