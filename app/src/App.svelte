@@ -159,7 +159,13 @@
 
     booted = true;
 
-    navigator.storage.persisted().then((v) => (persisted = v));
+    // persist(), not just persisted() — iOS Safari has been observed revoking
+    // a prior grant on its own (storage pressure from another app appears
+    // sufficient), and the app previously only ever re-asked right after a
+    // download. Asking on every boot is the only way to notice and try to
+    // re-earn it before the next download, rather than silently staying
+    // unprotected until one happens.
+    navigator.storage.persist().then((v) => (persisted = v));
     shellCached = !!navigator.serviceWorker?.controller;
     db.getMeta('last_sync').then((v) => (lastSync = v));
     db.getMeta('last_verify').then((v) => (lastVerify = v));
