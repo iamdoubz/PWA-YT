@@ -9,6 +9,7 @@ are best-effort by design).
 
 import hashlib
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,30 @@ LRCLIB_BASE = "https://lrclib.net/api"
 USER_AGENT = "PWA-YT/0.4 (+https://github.com/iamdoubz/PWA-YT)"
 DURATION_TOLERANCE_S = 3
 TIMEOUT_S = 10
+
+# YouTube video titles are the title this app has, but they're a video
+# title, not a track title — "(Official Music Video)"/"(Lyric Video)" noise
+# and a redundant "Uploader - " prefix (uploader is already sent as
+# artist_name) both measurably hurt LRCLIB's search recall. Confirmed live:
+# the raw title for a real, definitely-on-LRCLIB single returned 2 weak
+# results; the cleaned title returned 20 with a solid duration match.
+# Deliberately narrow (keyword-gated, not "strip all parens") so a
+# legitimately-parenthetical part of a title — "(Taylor's Version)", "(feat.
+# X)", "(Remix)" — survives untouched.
+_NOISE = re.compile(
+    r"\s*[\(\[][^\)\]]*\b(official|video|audio|lyric|lyrics|visualizer|hd|4k|m/?v)\b[^\)\]]*[\)\]]\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_title(title: str, uploader: str | None) -> str:
+    if not title:
+        return title
+    t = title
+    if uploader and t.lower().startswith(uploader.lower() + " - "):
+        t = t[len(uploader) + 3 :]
+    t = _NOISE.sub(" ", t).strip()
+    return t or title  # never search on an empty string if cleaning ate everything
 
 
 def _search(track_name: str, artist_name: str) -> list[dict]:
@@ -66,7 +91,7 @@ def get_or_fetch(source_key: str, title: str | None, uploader: str | None,
         if row:
             return dict(row)
 
-    match = best_match(_search(title or "", uploader or ""), duration_s)
+    match = best_match(_search(_clean_title(title or "", uploader), uploader or ""), duration_s)
     synced = (match.get("syncedLyrics") or None) if match else None
     plain = (match.get("plainLyrics") or None) if match else None
     found = 1 if (synced or plain) else 0

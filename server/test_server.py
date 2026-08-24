@@ -157,6 +157,18 @@ def test_prefer_copy_never_upscales_a_bitrate():
     assert pipeline.should_copy({**aac, "audio_codec": "mp3"}, "mp4a.40.2", 129.5) is False
 
 
+def test_lyrics_clean_title_strips_video_noise_and_redundant_uploader_prefix():
+    import lyrics
+
+    assert lyrics._clean_title("Some Artist - A Song (Official Music Video)", "Some Artist") == "A Song"
+    assert lyrics._clean_title("Some Artist - A Song (Lyric Video) ft. Other", "Some Artist") == "A Song ft. Other"
+    # A genuinely parenthetical part of a title must survive — only
+    # noise-keyword-gated groups get stripped, not every set of parens.
+    assert lyrics._clean_title("A Song (Artist's Version)", "Artist") == "A Song (Artist's Version)"
+    # No uploader match at the front: title left alone apart from noise-strip.
+    assert lyrics._clean_title("Someone Else - A Song", "Some Artist") == "Someone Else - A Song"
+
+
 def test_lyrics_best_match_picks_closest_duration_within_tolerance():
     import lyrics
 
