@@ -625,6 +625,76 @@ def test_resolve_short_circuits_when_the_breaker_is_tripped():
         main._breaker_until = 0.0
 
 
+def test_magic_link_round_trip_and_single_use():
+    import auth
+
+    email = "magiclink@example.com"
+    user_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, email, "Magic", db.now()),
+        )
+
+    auth.request_magic_link(email)  # PWA_YT_SMTP_HOST unset in tests -> prints, doesn't mail
+    tokens = [cid for cid, v in auth._ceremonies.items() if v["kind"] == "magic_link" and v["email"] == email]
+    assert len(tokens) == 1, "a known email should produce exactly one pending ceremony"
+    token = tokens[0]
+
+    result = auth.verify_magic_link(token)
+    assert result["user"]["id"] == user_id
+    assert result["user"]["email"] == email
+    assert "token" in result and "expires_at" in result
+
+    try:
+        auth.verify_magic_link(token)
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 422, err
+    else:
+        raise AssertionError("a magic-link token should be single-use")
+
+
+def test_magic_link_unknown_email_is_silent():
+    import auth
+
+    before = len(auth._ceremonies)
+    auth.request_magic_link("nobody-registered@example.com")
+    after = len(auth._ceremonies)
+    assert after == before, "an unregistered email must not create a usable ceremony (no account-existence oracle)"
+
+
+def test_magic_link_rate_limited():
+    import auth
+
+    email = "ratelimit@example.com"
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, created_at) VALUES (?, ?, ?, ?)",
+            (db.uuid7(), email, "Rate", db.now()),
+        )
+
+    try:
+        auth.request_magic_link(email)  # 1st: fine
+        auth.request_magic_link(email)  # 2nd, immediately: cooldown
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 429, err
+    else:
+        raise AssertionError("a second request inside the cooldown window should be rate-limited")
+
+    # Past the cooldown but at the hourly cap — same trick other tests use to
+    # simulate elapsed time without sleeping for it.
+    now = time.monotonic()
+    auth._magic_link_sends[email] = [now - 120] * auth.MAGIC_LINK_MAX_PER_HOUR
+    try:
+        auth.request_magic_link(email)
+    except Exception as err:
+        assert getattr(err, "status_code", None) == 429, err
+    else:
+        raise AssertionError("exceeding the hourly cap should be rate-limited")
+    finally:
+        del auth._magic_link_sends[email]  # don't leak into other tests
+
+
 if __name__ == "__main__":
     db.init()  # schema must exist before any test that touches it
     failures = 0

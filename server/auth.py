@@ -22,9 +22,11 @@ import hashlib
 import json
 import os
 import secrets
+import smtplib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 
 import webauthn
 from fastapi import Header, HTTPException
@@ -56,6 +58,12 @@ ORIGINS = _origins_env or ["http://localhost:4173"]
 SESSION_TTL_S = 30 * 24 * 60 * 60
 CEREMONY_TTL_S = 5 * 60
 
+# Recovery/fallback path (D-008) — email round trips need longer than a
+# WebAuthn ceremony's 5 minutes.
+MAGIC_LINK_TTL_S = 15 * 60
+MAGIC_LINK_COOLDOWN_S = 60           # minimum gap between sends to one email
+MAGIC_LINK_MAX_PER_HOUR = 5          # "rate-limited hard", per 04-api.md
+
 # Pending ceremonies live in memory, not the database: they are seconds-lived,
 # single-process (FastAPI's threadpool, not the resolve/job process pools),
 # and there is nothing here worth surviving a restart — a dropped ceremony is
@@ -77,17 +85,23 @@ def _future(seconds: int) -> str:
 
 
 def _sweep_ceremonies() -> None:
-    cutoff = time.monotonic() - CEREMONY_TTL_S
+    now = time.monotonic()
     with _ceremony_lock:
-        for cid in [c for c, v in _ceremonies.items() if v["created"] < cutoff]:
+        for cid in [c for c, v in _ceremonies.items() if now - v["created"] > v["ttl"]]:
             _ceremonies.pop(cid, None)
 
 
-def _new_ceremony(kind: str, challenge: bytes, **extra) -> str:
+def _new_ceremony(kind: str, challenge: bytes, ttl: int = CEREMONY_TTL_S, **extra) -> str:
     _sweep_ceremonies()
     ceremony_id = secrets.token_urlsafe(16)
     with _ceremony_lock:
-        _ceremonies[ceremony_id] = {"kind": kind, "challenge": challenge, "created": time.monotonic(), **extra}
+        _ceremonies[ceremony_id] = {
+            "kind": kind,
+            "challenge": challenge,
+            "created": time.monotonic(),
+            "ttl": ttl,
+            **extra,
+        }
     return ceremony_id
 
 
@@ -97,7 +111,7 @@ def _take_ceremony(ceremony_id: str, kind: str) -> dict:
         entry = _ceremonies.pop(ceremony_id, None)
     if entry is None or entry["kind"] != kind:
         raise HTTPException(422, "That sign-in attempt expired or was already used. Try again.")
-    if time.monotonic() - entry["created"] > CEREMONY_TTL_S:
+    if time.monotonic() - entry["created"] > entry["ttl"]:
         raise HTTPException(422, "That sign-in attempt expired. Try again.")
     return entry
 
@@ -302,6 +316,115 @@ def finish_login(ceremony_id: str, credential: dict) -> dict:
             "UPDATE credentials SET sign_count = ?, last_used_at = ? WHERE id = ?",
             (verification.new_sign_count, db.now(), cred_id),
         )
+        session = create_session(conn, user_row["id"])
+
+    return {
+        "token": session["token"],
+        "expires_at": session["expires_at"],
+        "user": {
+            "id": user_row["id"],
+            "email": user_row["email"],
+            "display_name": user_row["display_name"],
+        },
+    }
+
+
+# --------------------------------------------------------------- magic link
+#
+# Recovery/fallback for a passkey-only account (D-008): every device's
+# passkey is bound to this RP_ID for life (see the CLAUDE.md/README traps),
+# so losing every enrolled authenticator otherwise means losing the account.
+# A magic link proves email ownership, which is enough to mint a session —
+# the signed-in user then enrolls a *new* passkey from the account settings
+# the normal registration ceremony already provides, this endpoint doesn't
+# need to know anything about that.
+#
+# Reuses the ceremony store above rather than a new table: the token is
+# exactly as random as a ceremony id, single-use the same way, and short-
+# lived enough that surviving a server restart was never a requirement.
+
+_magic_link_lock = threading.Lock()
+_magic_link_sends: dict[str, list[float]] = {}  # email -> send timestamps (monotonic)
+
+
+def _check_magic_link_rate_limit(email: str) -> None:
+    now = time.monotonic()
+    with _magic_link_lock:
+        sends = [t for t in _magic_link_sends.get(email, []) if now - t < 3600]
+        if sends and now - sends[-1] < MAGIC_LINK_COOLDOWN_S:
+            raise HTTPException(429, "A sign-in link was just sent to that address. Wait a bit before retrying.")
+        if len(sends) >= MAGIC_LINK_MAX_PER_HOUR:
+            raise HTTPException(429, "Too many sign-in links requested for that address. Try again later.")
+        sends.append(now)
+        _magic_link_sends[email] = sends
+
+
+def _send_email(to: str, subject: str, body: str) -> None:
+    host = os.environ.get("PWA_YT_SMTP_HOST")
+    if not host:
+        # ponytail: no mail relay configured — print instead of failing, same
+        # spirit as the auto-generated cookie key above. Fine for dev/self-
+        # hosting; a real deployment sets PWA_YT_SMTP_HOST.
+        print(f"[magic-link] PWA_YT_SMTP_HOST not set — would have emailed {to}:\n{body}", flush=True)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.environ.get("PWA_YT_SMTP_FROM", "noreply@pwa-yt.local")
+    msg["To"] = to
+    msg.set_content(body)
+
+    port = int(os.environ.get("PWA_YT_SMTP_PORT", "587"))
+    user = os.environ.get("PWA_YT_SMTP_USER")
+    password = os.environ.get("PWA_YT_SMTP_PASS")
+    with smtplib.SMTP(host, port, timeout=10) as smtp:
+        smtp.starttls()
+        if user:
+            smtp.login(user, password or "")
+        smtp.send_message(msg)
+
+
+def request_magic_link(email: str) -> None:
+    """Always succeeds from the caller's point of view — whether or not the
+    email is registered is never observable in the response, only (loosely)
+    in the rate limit, which applies regardless of registration status for
+    exactly that reason.
+
+    ponytail: sending an actual email (registered) vs. returning immediately
+    (not registered) is a timing side channel this doesn't close — an
+    invite-only app for "the owner and people they know" (R-12) rather than
+    an adversarial public. Add a constant-time delay if that threat model
+    ever changes.
+    """
+    _check_magic_link_rate_limit(email)
+
+    with db.reading() as conn:
+        user = conn.execute(
+            "SELECT id, disabled_at FROM users WHERE email = ?", (email,)
+        ).fetchone()
+    if user is None or user["disabled_at"] is not None:
+        return
+
+    token = _new_ceremony("magic_link", b"", ttl=MAGIC_LINK_TTL_S, user_id=user["id"], email=email)
+    origin = ORIGINS[0]
+    link = f"{origin}/?magic_link={token}"
+    _send_email(
+        email,
+        "Sign in to PWA-YT",
+        f"Click to sign in: {link}\n\nThis link works once and expires in {MAGIC_LINK_TTL_S // 60} minutes. "
+        "If you didn't request this, ignore it.",
+    )
+
+
+def verify_magic_link(token: str) -> dict:
+    entry = _take_ceremony(token, "magic_link")
+
+    with db.reading() as conn:
+        user_row = conn.execute("SELECT * FROM users WHERE id = ?", (entry["user_id"],)).fetchone()
+    if user_row is None or user_row["disabled_at"] is not None:
+        raise HTTPException(403, "This account is disabled.")
+
+    with db.writing() as conn:
         session = create_session(conn, user_row["id"])
 
     return {

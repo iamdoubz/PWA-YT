@@ -899,3 +899,71 @@ Live: confirmed `404` on all three with no env var, `200` on `/docs` with
 deployment ever wants docs reachable for a specific audience, gate them
 behind the same bearer auth everything else uses rather than making them
 unconditionally public again.
+
+---
+
+## D-028 · Magic-link fallback built, not a new table
+
+**Status:** accepted · 2026-08-24
+
+**Decision.** `POST /auth/magic-link/request` + `/verify` fill in D-008's
+"passkey primary with a magic-link fallback," deferred out of the v0.4 auth
+foundation pass and tracked as an open item in `04-api.md` and
+`06-build-plan.md` v0.4 scope. Picked up now because the project is between
+device tests (waiting on the R-2 storage-eviction repro window) and this
+needed no device to build or verify.
+
+**Token storage.** Reuses `auth.py`'s existing in-memory ceremony store
+rather than a new `magic_links` table — the token is exactly as random
+(`secrets.token_urlsafe(16)`) and single-use as a WebAuthn ceremony id
+already is, just with a longer TTL (15 minutes, vs. 5, to survive an actual
+email round trip) and no crypto to verify, only a DB lookup. `_take_ceremony`
+now reads its TTL from the ceremony entry itself instead of a shared
+constant, since register/login ceremonies and magic-link ceremonies no
+longer share one lifetime.
+
+**No account-existence oracle.** `/auth/magic-link/request` returns the same
+`{ok, message}` body whether or not the email is registered, and an unknown
+email creates no ceremony at all. The one thing this doesn't close: sending
+a real email (registered) vs. returning immediately (not) is a timing side
+channel — accepted for the same reason R-12 already scopes rate-limiting
+and body-size hardening down to this app's actual threat model
+(invite-only, "the owner and people they know," not an adversarial public).
+Marked with a `ponytail:` comment in `auth.py` naming the ceiling.
+
+**Rate limiting, "hard" per the original `04-api.md` note.** Per-email,
+in-memory: a 60-second cooldown between sends plus a 5-per-hour cap, both
+enforced ahead of the DB lookup so the limit applies identically to
+registered and unregistered addresses. No per-IP limiting — same
+invite-only threat-model call as above, and there's no IP to key on without
+adding infrastructure this app doesn't otherwise need.
+
+**Email delivery.** Stdlib `smtplib` + `email.message.EmailMessage`, no new
+dependency. `PWA_YT_SMTP_HOST` unset (the default, including in tests)
+prints the link to the server log instead of sending anything — the same
+"keep working with zero configuration, warn instead of failing" pattern the
+auto-generated `PWA_YT_COOKIE_KEY` already uses. A real deployment sets
+`PWA_YT_SMTP_HOST`/`_PORT`/`_USER`/`_PASS`/`_FROM`. The link's origin is
+`auth.ORIGINS[0]` — the same env var (`PWA_YT_ORIGINS`) WebAuthn already
+requires a real deployment to set, not a new one.
+
+**What this does not do.** A magic-link sign-in proves email ownership and
+mints a session; it does not enroll a new passkey. There is currently no
+endpoint that adds a credential to an already-authenticated account —
+`/auth/register/*` always creates a brand-new user, gated by an invite code
+that would conflict with the existing account's email. A device that lost
+its only passkey and recovers via magic link is a device that goes on
+needing a fresh magic link every 30 days, not one that can re-establish a
+passkey. Worth building if that gap ever bites in practice; not built now
+because nothing in the deferred scope note asked for it and it would have
+meant redesigning the registration ceremony's invite-consumption path
+rather than a lazy addition to it.
+
+**Verification.** Live against a running server (not just unit tests): a
+manually seeded user requested a link, the server printed it (no
+`PWA_YT_SMTP_HOST` set), the token verified into a working session that
+`/me` accepted, a second verify of the same token 422'd, an unregistered
+email got the identical `{ok, message}` response, an immediate second
+request for the same email 429'd on cooldown, and `test_server.py` gained
+three checks for the same paths (round trip + single-use, unknown-email
+silence, cooldown + hourly-cap) — 28 checks total, 0 failures.

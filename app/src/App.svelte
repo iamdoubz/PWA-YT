@@ -76,6 +76,9 @@
   let inviteCode = $state('');
   let authEmail = $state('');
   let authDisplayName = $state('');
+  let magicLinkView = $state(false); // login sub-view: request an email link
+  let magicLinkEmail = $state('');
+  let magicLinkMessage = $state(null);
 
   // Account settings — loaded lazily after first paint, same as everything
   // else that needs a network round trip. FM-2.
@@ -200,6 +203,15 @@
     // The other trigger for reconciling — reconnect can happen with the app
     // already open and idle, not just at boot.
     window.addEventListener('online', reconcile);
+
+    // A magic-link click lands here with ?magic_link=<token> on first load.
+    // Only present when it's actually a magic-link visit, so this never adds
+    // a network call to the ordinary boot path (FM-2).
+    const magicToken = new URL(location.href).searchParams.get('magic_link');
+    if (magicToken) {
+      history.replaceState(null, '', location.pathname);
+      queueMicrotask(() => finishMagicLink(magicToken));
+    }
   });
 
   async function refreshStorage() {
@@ -337,6 +349,35 @@
       const begin = await api.loginBegin();
       const credential = await startAuthentication({ optionsJSON: begin.options });
       const result = await api.loginFinish(begin.ceremony_id, credential);
+      await applySession(result);
+    } catch (err) {
+      authError = err.message;
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  async function doMagicLinkRequest() {
+    if (!magicLinkEmail.trim()) return;
+    authError = null;
+    magicLinkMessage = null;
+    authBusy = true;
+    try {
+      const result = await api.magicLinkRequest(magicLinkEmail.trim());
+      magicLinkMessage = result.message;
+    } catch (err) {
+      authError = err.message;
+    } finally {
+      authBusy = false;
+    }
+  }
+
+  // Runs unprompted at boot when the URL carries ?magic_link=<token> (a click
+  // from the emailed link) — not part of the normal sign-in button flow.
+  async function finishMagicLink(token) {
+    authBusy = true;
+    try {
+      const result = await api.magicLinkVerify(token);
       await applySession(result);
     } catch (err) {
       authError = err.message;
@@ -1016,6 +1057,30 @@
         <button class="ghost" onclick={() => (authView = 'login')}>
           Already have an account? Sign in
         </button>
+      {:else if magicLinkView}
+        <h2>Email me a sign-in link</h2>
+        {#if magicLinkMessage}
+          <p class="dim">{magicLinkMessage}</p>
+        {:else}
+          <input
+            type="email"
+            placeholder="Email"
+            bind:value={magicLinkEmail}
+            aria-label="Email"
+          />
+          <button onclick={doMagicLinkRequest} disabled={authBusy || !magicLinkEmail.trim()}>
+            {authBusy ? 'Sending…' : 'Send sign-in link'}
+          </button>
+        {/if}
+        <button
+          class="ghost"
+          onclick={() => {
+            magicLinkView = false;
+            magicLinkMessage = null;
+          }}
+        >
+          Back to passkey sign-in
+        </button>
       {:else}
         <h2>Sign in</h2>
         <button onclick={doLogin} disabled={authBusy}>
@@ -1023,6 +1088,9 @@
         </button>
         <button class="ghost" onclick={() => (authView = 'register')}>
           Have an invite code? Register
+        </button>
+        <button class="ghost" onclick={() => (magicLinkView = true)}>
+          Lost your passkey? Email me a sign-in link
         </button>
       {/if}
     </section>

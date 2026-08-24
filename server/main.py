@@ -146,13 +146,21 @@ class CeremonyFinishRequest(BaseModel):
     credential: dict
 
 
+class MagicLinkRequest(BaseModel):
+    email: str = Field(min_length=3)
+
+
+class MagicLinkVerify(BaseModel):
+    token: str = Field(min_length=1)
+
+
 def error(status: int, code: str, message: str, **extra) -> JSONResponse:
     """Messages are written for the user, not the log. Say what happened and
     what to do about it."""
     return JSONResponse({"error": code, "message": message, **extra}, status_code=status)
 
 
-_ERROR_CODES = {401: "unauthorized", 403: "forbidden", 404: "not_found", 422: "invalid_request"}
+_ERROR_CODES = {401: "unauthorized", 403: "forbidden", 404: "not_found", 422: "invalid_request", 429: "rate_limited"}
 
 
 # ---------------------------------------------------------------- job runner
@@ -593,6 +601,18 @@ def login_begin():
 @app.post("/auth/login/finish")
 def login_finish(req: CeremonyFinishRequest):
     return auth.finish_login(req.ceremony_id, req.credential)
+
+
+@app.post("/auth/magic-link/request")
+def magic_link_request(req: MagicLinkRequest):
+    # Same response whether or not the email is registered — see auth.py.
+    auth.request_magic_link(req.email.strip().lower())
+    return {"ok": True, "message": "If that email is registered, a sign-in link was sent."}
+
+
+@app.post("/auth/magic-link/verify")
+def magic_link_verify(req: MagicLinkVerify):
+    return auth.verify_magic_link(req.token.strip())
 
 
 @app.post("/auth/logout")

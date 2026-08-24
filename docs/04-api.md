@@ -19,11 +19,23 @@ See `08-decisions.md` D-019.
 | `POST` | `/auth/register/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}`. Creates the user + credential and consumes the invite in one transaction. |
 | `POST` | `/auth/login/begin` | No body — usernameless. → `{ceremony_id, options}` with an empty `allowCredentials`, so the authenticator's own picker shows every passkey for this RP. |
 | `POST` | `/auth/login/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}`. |
-| `POST` | `/auth/magic-link` | **Deferred** — not built in the auth foundation pass. Fallback and recovery path, to be rate-limited hard when it lands. |
+| `POST` | `/auth/magic-link/request` | `{email}` → `{ok, message}`, always the same response whether or not the email is registered. Rate-limited per email: 60s cooldown, 5/hour. See D-028. |
+| `POST` | `/auth/magic-link/verify` | `{token}` (from the emailed link's `?magic_link=` query param) → `{token, expires_at, user}`, same shape as login/register finish. Single-use, expires in 15 minutes. |
 | `POST` | `/auth/logout` | Invalidates the session server-side only. |
 
 Invite codes are minted by `server/scripts/create_invite.py`, an operator
 action — there is deliberately no endpoint for it.
+
+**Magic link, D-008's fallback/recovery path, now built.** Proves email
+ownership and mints a session exactly like a passkey login does — it does
+**not** enroll a new passkey, since there is currently no endpoint that adds
+a credential to an already-authenticated account (registration always
+creates a brand-new user, gated by an invite code). A magic-link sign-in on
+a device with no enrolled passkey is a session that cannot renew itself past
+the 30-day TTL without another magic link. Revisit if that turns out to
+matter in practice. Configured via `PWA_YT_SMTP_HOST`/`_PORT`/`_USER`/`_PASS`/
+`_FROM`; unset, the link is printed to the server log instead of emailed
+(dev-friendly, same spirit as the auto-generated cookie key).
 
 **Client rule:** logout clears the token from `meta`. It does **not** clear
 `items`, `local_media`, `artwork`, or OPFS. See `02-offline-playback.md` FM-2.

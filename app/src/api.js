@@ -72,6 +72,12 @@ export const loginFinish = (ceremony_id, credential) =>
     body: JSON.stringify({ ceremony_id, credential }),
   });
 
+export const magicLinkRequest = (email) =>
+  request('/auth/magic-link/request', { method: 'POST', body: JSON.stringify({ email }) });
+
+export const magicLinkVerify = (token) =>
+  request('/auth/magic-link/verify', { method: 'POST', body: JSON.stringify({ token }) });
+
 // Best-effort: server-side session invalidation only. The caller owns
 // clearing the local session — and must never clear items/local_media/OPFS
 // alongside it. See FM-2.

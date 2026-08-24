@@ -310,7 +310,7 @@ server/                       stateless transformer — never a media library
   auth.py                     passkeys, invite codes, bearer sessions
   extract.py                  yt-dlp probe: single item or flat playlist enum
   pipeline.py                 fetch + ffmpeg; runs in a subprocess
-  test_server.py              25 checks, plain asserts, no pytest
+  test_server.py              28 checks, plain asserts, no pytest
   scripts/seed_queue.py       seeds N ready jobs for queue testing
   scripts/create_invite.py    mints an invite code (operator action, no endpoint)
 ```
@@ -339,6 +339,8 @@ server/                       stateless transformer — never a media library
 | `POST` | `/auth/register/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}` |
 | `POST` | `/auth/login/begin` | usernameless — no body, empty `allowCredentials` |
 | `POST` | `/auth/login/finish` | `{ceremony_id, credential}` → `{token, expires_at, user}` |
+| `POST` | `/auth/magic-link/request` | `{email}` → `{ok, message}`, same response regardless of registration status; rate-limited |
+| `POST` | `/auth/magic-link/verify` | `{token}` → `{token, expires_at, user}`, single-use |
 | `POST` | `/auth/logout` | invalidates the session server-side only |
 | `GET` | `/me` | profile, `daily_byte_budget`, `max_concurrent` |
 | `GET` | `/me/usage` | `{bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs}` |
@@ -428,14 +430,29 @@ This is the desktop analogue of the plane test — it is *not* a substitute for 
 
 | Phase | Scope | Notes |
 |---|---|---|
-| v0.4 | Magic-link fallback | deliberately not built, not just unstarted — see 04-api.md |
 | v0.4 | `PUT /me/settings` | no real per-user setting exists yet to justify it — see 04-api.md |
 | v1.0 | Video (`keep_video`), muxing, video view | pipeline rejects `keep_video` |
 | v1.0 | `ffmpeg.wasm` client transcode, COEP | |
 | v1.0 | Nightly `VACUUM INTO` backup | |
 
 All other v0.4 scope — per-user budgets/usage ledger, multi-device sync,
-encrypted cookie jar, 429 backoff/circuit-breaker — is built. See below.
+encrypted cookie jar, 429 backoff/circuit-breaker, magic-link fallback — is
+built. See below.
+
+### Magic-link fallback, built 2026-08-24
+
+`POST /auth/magic-link/request` + `/verify` — see D-028 for the full
+reasoning. Reuses the existing WebAuthn ceremony store rather than a new
+table, rate-limited per email (60s cooldown, 5/hour) ahead of the DB lookup
+so registered and unregistered addresses are indistinguishable from the
+response, and emails via stdlib `smtplib` or prints to the server log if
+`PWA_YT_SMTP_HOST` is unset. Verified live against a running server (seeded
+user, real request → printed link → verify → working session → single-use
+enforced → cooldown enforced) plus three new `test_server.py` checks (28
+total, 0 failures). Known gap, not built: no way to enroll a *new* passkey
+from an already-authenticated session, so a magic-link sign-in doesn't
+recover a device's ability to log in with a passkey again — see D-028's
+"What this does not do."
 
 ### v0.4 auth foundation, built this session
 
@@ -669,7 +686,7 @@ cd server && uv run python scripts/create_invite.py    # prints a code, e.g. 5ae
 ```
 
 ```bash
-cd server && uv run python test_server.py    # 25 checks
+cd server && uv run python test_server.py    # 28 checks
 cd app && npm run test:sha                   # sha256 vectors
 cd app && npm run check:no-cdn               # fails on absolute URLs in dist/
 ```
