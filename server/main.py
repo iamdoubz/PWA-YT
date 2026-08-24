@@ -231,7 +231,7 @@ def _user_cookies(user_id: str) -> str | None:
         return None
 
 
-def _finish(job_id: str, result: dict, scratch_dir: Path, user_id: str) -> None:
+def _finish(job_id: str, item_id: str, result: dict, scratch_dir: Path, user_id: str) -> None:
     # By name prefix, not an exact "audio.m4a": an MP3 profile emits audio.mp3,
     # and the exact-match version raised StopIteration on the first one.
     audio = next(
@@ -261,6 +261,18 @@ def _finish(job_id: str, result: dict, scratch_dir: Path, user_id: str) -> None:
                 job_id,
             ),
         )
+        # extract.py's flat playlist probe leaves title/uploader blank for
+        # extractors (SoundCloud) that don't report them in flat mode — this
+        # is the first point a full per-item extraction has run, so backfill
+        # the catalogue row if resolve-time left it empty. Bumping updated_at
+        # only when it actually changes is what gets the fix to other devices
+        # over /sync without touching rows that were already correct.
+        if result.get("title"):
+            conn.execute(
+                """UPDATE library_items SET title=?, uploader=?, updated_at=?
+                    WHERE id=? AND (title IS NULL OR title = '')""",
+                (result["title"], result.get("uploader"), db.now(), item_id),
+            )
     # Recorded against actual bytes produced, not the /resolve-time estimate —
     # that estimate is what gates starting a *new* job (see create_items), but
     # what actually counts against the budget is what actually got made.
@@ -374,7 +386,7 @@ def _runner() -> None:
                 pipeline.run, row["canonical_url"], profile, str(scratch_dir), cookies_text
             )
             _pump_progress(job["id"], future, scratch_dir)
-            _finish(job["id"], future.result(timeout=0), scratch_dir, job["user_id"])
+            _finish(job["id"], job["item_id"], future.result(timeout=0), scratch_dir, job["user_id"])
             _reset_breaker()  # a completed job is proof the shared IP isn't blocked right now
         except FutureTimeout:
             future.cancel()

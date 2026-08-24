@@ -238,6 +238,12 @@ def run(url: str, profile: dict, scratch_dir: str, cookies_text: str | None = No
     names = [audio.name] + (["art.jpg", "art-sq.jpg"] if has_art else [])
     return {
         "copied": copied,
+        # extract.py's flat playlist probe leaves these blank for extractors
+        # (SoundCloud) that don't report metadata in flat mode — this full,
+        # single-item extraction always has them, so the caller backfills the
+        # catalogue row with whatever was actually found here.
+        "title": info.get("title"),
+        "uploader": info.get("uploader") or info.get("channel"),
         "files": [
             {"name": n, "bytes": (scratch / n).stat().st_size, "sha256": _sha256(scratch / n)}
             for n in names
