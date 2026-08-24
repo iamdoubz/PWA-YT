@@ -52,6 +52,15 @@
   // track at a different bitrate genuinely re-pulls it at that bitrate.
   let profile = $state({ audio_codec: 'aac', audio_bitrate: 192, save_artwork: true });
 
+  // Client-only, not part of `profile`: it never goes over the wire, it just
+  // decides whether confirmAdd()/confirmPlaylistImport() fire off a lyrics
+  // search the instant an item is added. For a flat-probed source
+  // (SoundCloud playlist entries — see extract.py) title/uploader aren't
+  // known yet at that point, so the search has nothing to search with. The
+  // "Find lyrics" menu action still works any time after the download
+  // finishes and the real title is in; this only gates the automatic one.
+  let lookupLyrics = $state(true);
+
   let persisted = $state(null);
   let moveSupported = $state(null);
   let mediaActions = $state({});
@@ -517,7 +526,7 @@
       urlInput = '';
       sheet = null;
       startPolling();
-      findLyrics(row); // fire-and-forget, best-effort — never blocks the add flow
+      if (lookupLyrics) findLyrics(row); // fire-and-forget, best-effort — never blocks the add flow
     } catch (err) {
       planError = err.message;
     }
@@ -563,7 +572,7 @@
         };
         await db.put('items', itemRow);
         items = [itemRow, ...items.filter((it) => it.id !== itemRow.id)];
-        findLyrics(itemRow); // fire-and-forget, best-effort — no throttling across a bulk import
+        if (lookupLyrics) findLyrics(itemRow); // fire-and-forget, best-effort — no throttling across a bulk import
 
         const piRow = {
           playlist_id: playlistId,
@@ -1651,6 +1660,9 @@
           </div>
           <label class="chip-check">
             <input type="checkbox" bind:checked={profile.save_artwork} /> Artwork
+          </label>
+          <label class="chip-check">
+            <input type="checkbox" bind:checked={lookupLyrics} /> Look up lyrics
           </label>
           <p class="dim tiny">
             Stored per item. Re-adding a track at a different setting re-pulls it at that setting.
