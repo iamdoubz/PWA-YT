@@ -11,6 +11,11 @@ import * as api from './api.js';
 
 function wins(incoming, local) {
   if (!local) return true;
+  // A local row with no `updated_at` (an optimistic write that forgot to
+  // stamp one) must still lose to a real one — `"2026-..." > undefined` is
+  // `false` in JS, so without this check that row would never sync-update
+  // again, permanently stuck with whatever the optimistic write guessed.
+  if (!local.updated_at) return true;
   if (incoming.updated_at !== local.updated_at) return incoming.updated_at > local.updated_at;
   return !!incoming.deleted_at && !local.deleted_at;
 }

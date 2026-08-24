@@ -513,13 +513,21 @@
     plan = null;
     try {
       const created = (await api.createItem(entry.source_key, $state.snapshot(profile))).items[0];
+      const stamp = new Date().toISOString();
       const row = {
         id: created.item_id,
         source_key: entry.source_key,
         title: entry.title,
         uploader: entry.uploader,
         duration_s: entry.duration_s,
-        added_at: new Date().toISOString(),
+        added_at: stamp,
+        // sync.js's wins() compares `incoming.updated_at > local.updated_at` —
+        // with this undefined, that's `realDate > undefined`, which JS always
+        // evaluates false, so a later /sync response (e.g. the title/duration
+        // a flat-probed SoundCloud source only gets once its job's full
+        // extraction backfills `sources`) permanently loses to this row and
+        // never gets applied. Stamping it here is what lets that update win.
+        updated_at: stamp,
       };
       await db.put('items', row);
       items = [row, ...items.filter((i) => i.id !== row.id)];
@@ -569,6 +577,11 @@
           uploader: src.uploader,
           duration_s: src.duration_s,
           added_at: stamp,
+          // See confirmAdd's comment: without this, sync.js's wins() can never
+          // apply a later /sync update (e.g. SoundCloud's flat-probed title/
+          // duration, backfilled once each job's full extraction runs) to
+          // this row — a real timestamp is never `>` an undefined one.
+          updated_at: stamp,
         };
         await db.put('items', itemRow);
         items = [itemRow, ...items.filter((it) => it.id !== itemRow.id)];
