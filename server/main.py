@@ -26,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import yt_dlp
+
 import auth
 import db
 import extract
@@ -516,7 +518,7 @@ _enable_docs = os.environ.get("PWA_YT_ENABLE_DOCS", "").lower() in ("1", "true",
 
 app = FastAPI(
     title="PWA-YT",
-    version="0.1.0",
+    version="0.4.0",
     lifespan=lifespan,
     docs_url="/docs" if _enable_docs else None,
     redoc_url="/redoc" if _enable_docs else None,
@@ -555,7 +557,7 @@ async def _http_exception_handler(_, exc: HTTPException):
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "version": app.version}
+    return {"ok": True, "version": app.version, "yt_dlp_version": yt_dlp.version.__version__}
 
 
 @app.get("/health/extractors")

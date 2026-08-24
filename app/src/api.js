@@ -169,6 +169,10 @@ export const putCookies = (cookies) =>
 export const cookiesStatus = () => request('/me/cookies');
 export const deleteCookies = () => request('/me/cookies', { method: 'DELETE' });
 
+// Unauthenticated — the Account sheet's version footer needs it whether or
+// not a session is still valid.
+export const health = () => request('/health');
+
 export const listJobs = () => request('/jobs');
 
 export const retryJob = (id) => request(`/jobs/${id}/retry`, { method: 'POST' });

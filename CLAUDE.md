@@ -57,6 +57,12 @@ believe one is wrong, say so explicitly and argue it; do not silently deviate.
 - Timestamps are ISO 8601 UTC strings (`YYYY-MM-DDTHH:MM:SS.sssZ`) everywhere,
   including in SQLite. IDs are UUIDv7 as TEXT.
 - Conventional commits. Version bumps are conservative and explained.
+- The version number is kept in three places and all three move together:
+  `server/pyproject.toml` (`[project].version`), the FastAPI `app.version` in
+  `server/main.py` (what `/health` reports, and what the Account sheet's
+  footer displays), and `app/package.json` (`.version`). There is no build
+  step that derives one from another — bump all three by hand in the same
+  commit.
 
 ## Verifying your work
 

@@ -87,6 +87,7 @@
   // else that needs a network round trip. FM-2.
   let usage = $state(null); // { bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs } | null
   let cookiesInfo = $state(null); // { configured, updated_at } | null
+  let health = $state(null); // { version, yt_dlp_version } | null — server /health, shown in the Account footer
   let cookiesText = $state('');
   let cookiesBusy = $state(false);
   let cookiesMessage = $state(null);
@@ -341,6 +342,11 @@
     }
     try {
       cookiesInfo = await api.cookiesStatus();
+    } catch {
+      /* same */
+    }
+    try {
+      health = await api.health();
     } catch {
       /* same */
     }
@@ -1671,6 +1677,12 @@
         <p class="dim tiny">
           Assertion 12: after a cold boot in airplane mode, with no downloads started, "ok" must read 0.
           Counts main-thread fetch only.
+        </p>
+
+        <p class="dim tiny" style="margin-top: 16px;">
+          PWA-YT {health?.version ?? '…'}
+          · <a href="https://github.com/iamdoubz/PWA-YT" target="_blank" rel="noopener">source</a>
+          · yt-dlp {health?.yt_dlp_version ?? '…'}
         </p>
       </div>
     </div>
