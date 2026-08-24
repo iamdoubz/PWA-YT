@@ -2837,6 +2837,11 @@
     overflow-y: auto;
     text-align: center;
     scroll-behavior: smooth;
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* old Edge */
+  }
+  .lyrics-panel::-webkit-scrollbar {
+    display: none; /* Chrome/Safari */
   }
   .lyrics-panel p {
     margin: 10px 0;
