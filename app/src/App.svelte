@@ -706,7 +706,13 @@
       // It just silently eats the storage the user is trying to budget.
       // Adopting other devices' items is what /sync is for, in v0.4.
       const known = items.some((i) => i.id === job.item_id);
-      if (known && job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
+      // media[...] !== 'present' closes a race with acknowledge() below: this
+      // device frees `inFlight` well before the server hears the job was
+      // collected (db.put/media-write/refreshStorage all happen in between),
+      // so a still-"ready" update landing in that window would otherwise
+      // re-trigger a pull of a job whose bytes are already on disk.
+      const alreadyHave = media[job.item_id]?.state === 'present';
+      if (known && !alreadyHave && job.state === 'ready' && job.files.length && !inFlight.has(job.item_id)) {
         pull(job);
       }
       if (known && ACTIVE.includes(job.state)) busy = true;
