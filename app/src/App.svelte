@@ -1578,7 +1578,12 @@
           <Icon name="library" size={22} />
           <span>Library</span>
         </button>
-        <button class="nav-fab" onclick={() => (sheet = sheet === 'add' ? null : 'add')} aria-label="Add by URL">
+        <button
+          class="nav-fab"
+          class:docked={playing && !playerExpanded}
+          onclick={() => (sheet = sheet === 'add' ? null : 'add')}
+          aria-label="Add by URL"
+        >
           <Icon name="plus" size={26} />
         </button>
         <button class="nav-item" class:active={view === 'playlists'} onclick={() => (view = 'playlists')}>
@@ -2275,6 +2280,13 @@
     background: var(--accent);
     color: var(--accent-ink);
   }
+  /* Without this, :hover's `background: var(--surface)` above (higher
+     specificity than .accent alone) swaps the orange background for a dark
+     one while accent-ink — chosen for contrast against orange — stays dark,
+     making the icon nearly invisible. Keep the accent background on hover. */
+  .icon-btn.accent:hover:not(:disabled) {
+    background: var(--accent);
+  }
   .icon-btn.danger {
     color: var(--danger);
   }
@@ -2646,6 +2658,13 @@
   }
   .nav-fab:active {
     transform: scale(0.94);
+  }
+  /* The -18px pop above .bottomnav's top edge is fine when there's empty
+     space above it, but when .miniplayer docks directly above (same .dock
+     column), that pop reaches into the miniplayer bar instead. Flush is
+     the simplest way to never overlap it. */
+  .nav-fab.docked {
+    margin-top: 0;
   }
   .nav-fab:focus-visible {
     outline: 2px solid var(--accent);
