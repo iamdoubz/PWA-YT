@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS sources (
   refreshed_at  TEXT NOT NULL
 );
 
+-- Shared, semi-permanent cache keyed by source, not by user — LRCLIB has no
+-- auth and no per-user concept, so every user pulling the same track reuses
+-- one lookup. found=0 with synced/plain both NULL means "checked, LRCLIB has
+-- nothing" — that result is cached too, so re-adding a not-found track across
+-- users/devices doesn't re-hit LRCLIB every time.
+CREATE TABLE IF NOT EXISTS lyrics (
+  source_key TEXT PRIMARY KEY REFERENCES sources(source_key) ON DELETE CASCADE,
+  synced     TEXT,
+  plain      TEXT,
+  found      INTEGER NOT NULL,
+  checked_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS library_items (
   id             TEXT PRIMARY KEY,
   user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

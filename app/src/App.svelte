@@ -99,6 +99,12 @@
   let playerExpanded = $state(false); // mini-player vs. full player sheet
   let openMenuItemId = $state(null); // which row's kebab menu is open (item or playlist id)
 
+  // Now-playing lyrics panel. lyricsLines set (even to []) means synced;
+  // lyricsPlain set means plain-only; both null means not open/not loaded.
+  let lyricsOpen = $state(false);
+  let lyricsLines = $state(null); // [{time, text}] | null
+  let lyricsPlain = $state(null); // string | null
+
   // Dark is the default (D-029). A light choice is read back from the
   // `data-theme` attribute an inline script in index.html already set
   // before first paint (from the same localStorage key setTheme writes),
@@ -138,6 +144,7 @@
   let worker;
   let poll = null;
   const inFlight = new Set();
+  const lyricsAttempt = {}; // itemId -> 'lrc' | 'txt', which variant is currently being fetched
 
   const playing = $derived(items.find((i) => i.id === playingId) ?? null);
   // "downloaded" means the bytes are here, not that a row once claimed they were.
@@ -510,6 +517,7 @@
       urlInput = '';
       sheet = null;
       startPolling();
+      findLyrics(row); // fire-and-forget, best-effort — never blocks the add flow
     } catch (err) {
       planError = err.message;
     }
@@ -555,6 +563,7 @@
         };
         await db.put('items', itemRow);
         items = [itemRow, ...items.filter((it) => it.id !== itemRow.id)];
+        findLyrics(itemRow); // fire-and-forget, best-effort — no throttling across a bulk import
 
         const piRow = {
           playlist_id: playlistId,
@@ -752,6 +761,28 @@
     });
   }
 
+  // Independent of the job/pull machinery above: no job, no artifact TTL,
+  // just a small cached-or-fetched text file. sweep:false is what stops this
+  // from deleting audio/art on the way in — see opfs-worker.js.
+  function pullLyrics(itemId, variant, force = false) {
+    lyricsAttempt[itemId] = variant;
+    worker.postMessage({
+      type: 'download',
+      itemId,
+      files: [{ name: `lyrics.${variant}`, url: `${API}/items/${itemId}/lyrics/${variant}${force ? '?force=true' : ''}` }],
+      token: session?.token,
+      sweep: false,
+      kind: 'lyrics',
+    });
+  }
+
+  // Synced preferred over plain (see onWorkerMessage's 'lyrics' branch for
+  // the one-shot txt fallback on a 404). force is only ever true from the
+  // retroactive "Find lyrics" menu action.
+  function findLyrics(item, { force = false } = {}) {
+    pullLyrics(item.id, 'lrc', force);
+  }
+
   // FM-6 recovery, and the highest-value button in the app: it tells someone
   // about to board a plane what is actually on their device, while there is
   // still network to fix it.
@@ -803,6 +834,29 @@
   const mimeFor = (name) => (name.includes('.mp3') ? 'audio/mpeg' : 'audio/mp4');
 
   async function onWorkerMessage({ data }) {
+    // First and separate from everything below: inFlight/progress are keyed
+    // only by itemId and shared with genuine audio-job pulls for the same
+    // item, so a lyrics message must never touch them (see the plan's
+    // concurrency note) — hence this branch returns before either is read.
+    if (data.kind === 'lyrics') {
+      const variant = lyricsAttempt[data.itemId];
+      delete lyricsAttempt[data.itemId];
+      if (data.type === 'done') {
+        const field = variant === 'lrc' ? 'synced' : 'plain';
+        const existing = media[data.itemId] ?? { item_id: data.itemId, state: 'missing', files: [] };
+        const row = { ...existing, lyrics: { ...existing.lyrics, [field]: true } };
+        await db.put('local_media', row);
+        media[data.itemId] = row;
+      } else if (data.type === 'error' && variant === 'lrc') {
+        // The lrc request already ran the server's cache-check-or-search, so
+        // this txt attempt reads that now-fresh cache — no force, no second
+        // LRCLIB hit. Any further failure is silent: LRCLIB simply has
+        // nothing for this track, which is the expected common case, not
+        // an error worth surfacing.
+        pullLyrics(data.itemId, 'txt');
+      }
+      return;
+    }
     if (data.type === 'progress') {
       progress[data.itemId] = data.done / data.total;
       return;
@@ -895,6 +949,57 @@
     urls[row.item_id] = next;
   }
 
+  function parseLrc(text) {
+    const LINE = /^\[(\d+):(\d+(?:\.\d+)?)\](.*)$/;
+    return text
+      .split('\n')
+      .map((l) => l.match(LINE))
+      .filter(Boolean)
+      .map((m) => ({ time: Number(m[1]) * 60 + Number(m[2]), text: m[3].trim() }))
+      .sort((a, b) => a.time - b.time);
+  }
+
+  // Reads back out of OPFS on the main thread — writing needs the dedicated
+  // worker (createSyncAccessHandle), but reading is the same async File API
+  // resolveUrls already uses above, no new worker message type needed.
+  async function openLyrics(item) {
+    lyricsOpen = true;
+    lyricsLines = null;
+    lyricsPlain = null;
+    const m = media[item.id]?.lyrics;
+    if (!m) return;
+    try {
+      const root = await navigator.storage.getDirectory();
+      const dir = await (await root.getDirectoryHandle('media')).getDirectoryHandle(item.id);
+      if (m.synced) {
+        const text = await (await (await dir.getFileHandle('lyrics.lrc')).getFile()).text();
+        lyricsLines = parseLrc(text);
+      } else if (m.plain) {
+        lyricsPlain = await (await (await dir.getFileHandle('lyrics.txt')).getFile()).text();
+      }
+    } catch {
+      // Evicted since it was recorded present (FM-6, same as resolveUrls).
+      // The server cache still has the text, so this re-pull needs no new
+      // LRCLIB query — see get_or_fetch's cache-unless-force behaviour.
+      findLyrics(item);
+    }
+  }
+
+  const activeLyricIndex = $derived.by(() => {
+    if (!lyricsLines) return -1;
+    let idx = -1;
+    for (let i = 0; i < lyricsLines.length; i++) {
+      if (lyricsLines[i].time <= at) idx = i;
+      else break;
+    }
+    return idx;
+  });
+
+  $effect(() => {
+    if (activeLyricIndex < 0) return;
+    document.getElementById(`lyric-line-${activeLyricIndex}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+
   async function redownload(item) {
     if (jobs[item.id] && ACTIVE.includes(jobs[item.id].state)) return;
     errors[item.id] = null;
@@ -967,6 +1072,9 @@
       playingId = item.id;
       queuePlaylistId = playlistId;
       setMetadata(item);
+      lyricsOpen = false;
+      lyricsLines = null;
+      lyricsPlain = null;
     }
     audio.play().catch((err) => {
       errors[item.id] = `Playback failed: ${err.name} — ${err.message}`;
@@ -1269,6 +1377,17 @@
                       {:else}
                         <span class="menu-empty dim">No playlists yet</span>
                       {/each}
+                      {#if !media[item.id]?.lyrics?.synced && !media[item.id]?.lyrics?.plain}
+                        <button
+                          role="menuitem"
+                          onclick={() => {
+                            findLyrics(item, { force: true });
+                            openMenuItemId = null;
+                          }}
+                        >
+                          <Icon name="lyrics" size={16} /> Find lyrics
+                        </button>
+                      {/if}
                       <button
                         role="menuitem"
                         class="danger"
@@ -1704,15 +1823,40 @@
         <span class="sheet-kicker">
           {(queuePlaylistId && activePlaylists.find((p) => p.id === queuePlaylistId)?.name) || 'Library'}
         </span>
-        <span class="spacer-44"></span>
-      </div>
-      <div class="player-art">
-        {#if urls[playing.id]?.art}
-          <img src={urls[playing.id].art} alt="" />
+        {#if media[playing.id]?.lyrics?.synced || media[playing.id]?.lyrics?.plain}
+          <button
+            class="icon-btn"
+            class:accent={lyricsOpen}
+            onclick={() => (lyricsOpen ? (lyricsOpen = false) : openLyrics(playing))}
+            aria-label="Toggle lyrics"
+          >
+            <Icon name="lyrics" size={20} />
+          </button>
         {:else}
-          <span class="art-fallback"><Icon name="library" size={48} /></span>
+          <span class="spacer-44"></span>
         {/if}
       </div>
+      {#if lyricsOpen}
+        <div class="lyrics-panel">
+          {#if lyricsLines}
+            {#each lyricsLines as line, i (line.time)}
+              <p id={`lyric-line-${i}`} class:active={i === activeLyricIndex}>{line.text}</p>
+            {/each}
+          {:else if lyricsPlain}
+            <p class="lyrics-plain">{lyricsPlain}</p>
+          {:else}
+            <p class="dim">Loading lyrics…</p>
+          {/if}
+        </div>
+      {:else}
+        <div class="player-art">
+          {#if urls[playing.id]?.art}
+            <img src={urls[playing.id].art} alt="" />
+          {:else}
+            <span class="art-fallback"><Icon name="library" size={48} /></span>
+          {/if}
+        </div>
+      {/if}
       <div class="player-meta">
         <strong class="player-title">{playing.title}</strong>
         <span class="player-artist dim">{playing.uploader}</span>
@@ -2676,6 +2820,32 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
+  }
+  .lyrics-panel {
+    width: min(72vw, 320px);
+    height: min(72vw, 320px);
+    margin: 12px 0 20px;
+    padding: 12px;
+    box-sizing: border-box;
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    overflow-y: auto;
+    text-align: center;
+    scroll-behavior: smooth;
+  }
+  .lyrics-panel p {
+    margin: 10px 0;
+    color: var(--text-dim);
+    transition: color 0.15s ease;
+  }
+  .lyrics-panel p.active {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .lyrics-panel .lyrics-plain {
+    text-align: left;
+    white-space: pre-wrap;
+    color: var(--text);
   }
   .player-meta {
     width: 100%;

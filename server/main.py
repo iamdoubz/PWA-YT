@@ -23,7 +23,7 @@ from typing import Literal
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import yt_dlp
@@ -31,6 +31,7 @@ import yt_dlp
 import auth
 import db
 import extract
+import lyrics
 import pipeline
 
 RESOLVE_TIMEOUT_S = 60
@@ -951,6 +952,54 @@ def delete_item(item_id: str, user: dict = Depends(auth.current_user)):
                 (db.now(), db.now(), item_id),
             )
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ lyrics
+#
+# Sourced from LRCLIB (free, unauthenticated), cached server-side per
+# source_key — shared across users, since LRCLIB has no per-user concept.
+# Duration-tolerance matched against this app's own sources.duration_s; no
+# picker UI, best match wins, synced preferred over plain. See lyrics.py.
+
+
+def _owned_source(item_id: str, user_id: str):
+    with db.reading() as conn:
+        return conn.execute(
+            """SELECT s.source_key, s.title, s.uploader, s.duration_s
+                 FROM library_items i JOIN sources s ON s.source_key = i.source_key
+                WHERE i.id = ? AND i.user_id = ? AND i.deleted_at IS NULL""",
+            (item_id, user_id),
+        ).fetchone()
+
+
+@app.get("/items/{item_id}/lyrics/lrc")
+def get_lyrics_lrc(item_id: str, force: bool = False, user: dict = Depends(auth.current_user)):
+    src = _owned_source(item_id, user["id"])
+    if src is None:
+        return error(404, "not_found", "No such item.")
+    row = lyrics.get_or_fetch(src["source_key"], src["title"], src["uploader"], src["duration_s"], force)
+    if not row["synced"]:
+        return error(404, "not_found", "No synced lyrics for this track.")
+    return Response(
+        content=row["synced"],
+        media_type="text/plain; charset=utf-8",
+        headers={"X-Lyrics-SHA256": lyrics.sha256_text(row["synced"])},
+    )
+
+
+@app.get("/items/{item_id}/lyrics/txt")
+def get_lyrics_txt(item_id: str, force: bool = False, user: dict = Depends(auth.current_user)):
+    src = _owned_source(item_id, user["id"])
+    if src is None:
+        return error(404, "not_found", "No such item.")
+    row = lyrics.get_or_fetch(src["source_key"], src["title"], src["uploader"], src["duration_s"], force)
+    if not row["plain"]:
+        return error(404, "not_found", "No lyrics for this track.")
+    return Response(
+        content=row["plain"],
+        media_type="text/plain; charset=utf-8",
+        headers={"X-Lyrics-SHA256": lyrics.sha256_text(row["plain"])},
+    )
 
 
 # --------------------------------------------------------------- playlists

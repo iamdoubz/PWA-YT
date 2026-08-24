@@ -93,6 +93,26 @@ The `DELETE` is not optional cleanup — it is the contract that keeps the serve
 stateless. A client that downloads and never acknowledges leaves the artifact to
 the TTL reaper, which is a correctness backstop, not the happy path.
 
+## Lyrics
+
+Sourced from [LRCLIB](https://lrclib.net) (free, unauthenticated), cached
+server-side per `source_key` — shared across users, since LRCLIB has no
+per-user concept. Duration-tolerance matched (±3s) against this app's own
+`sources.duration_s`; no picker UI, best match wins, synced (LRC) preferred
+over plain when both exist.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/items/{id}/lyrics/lrc?force=` | Synced (LRC-format, timestamped) lyrics as `text/plain`. Unlike other GETs in this API, the first call for a source may write to the server-side lyrics cache (a transparent cache-fill, not a user mutation). `force=true` bypasses the cache and re-queries LRCLIB. 404 if none. |
+| `GET` | `/items/{id}/lyrics/txt?force=` | Plain, unsynced lyrics as `text/plain`. Same cache/force semantics. 404 if none. |
+
+**No `POST .../lyrics/search` and no `DELETE`.** A separate boolean
+search-then-serve round trip was considered and rejected: the GET already
+returns 200-with-body-or-404, which is the only signal the client needs
+before deciding whether to store the result — a second endpoint would only
+add a round trip. Removing lyrics locally is pure client-side OPFS +
+IndexedDB; the shared server cache staying intact is desirable, not a leak.
+
 ## Playlists
 
 | Method | Path | Notes |

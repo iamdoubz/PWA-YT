@@ -157,6 +157,73 @@ def test_prefer_copy_never_upscales_a_bitrate():
     assert pipeline.should_copy({**aac, "audio_codec": "mp3"}, "mp4a.40.2", 129.5) is False
 
 
+def test_lyrics_best_match_picks_closest_duration_within_tolerance():
+    import lyrics
+
+    results = [
+        {"duration": 180, "instrumental": False, "syncedLyrics": "x", "plainLyrics": "x"},
+        {"duration": 205, "instrumental": False, "syncedLyrics": "x", "plainLyrics": "x"},
+        {"duration": 400, "instrumental": False, "syncedLyrics": "x", "plainLyrics": "x"},
+    ]
+    match = lyrics.best_match(results, duration_s=203)
+    assert match["duration"] == 205
+
+
+def test_lyrics_best_match_rejects_outside_tolerance():
+    import lyrics
+
+    results = [{"duration": 300, "instrumental": False, "syncedLyrics": "x", "plainLyrics": "x"}]
+    assert lyrics.best_match(results, duration_s=200) is None
+
+
+def test_lyrics_best_match_skips_instrumental():
+    import lyrics
+
+    results = [{"duration": 200, "instrumental": True, "syncedLyrics": None, "plainLyrics": None}]
+    assert lyrics.best_match(results, duration_s=200) is None
+
+
+def test_lyrics_best_match_none_without_a_known_duration():
+    import lyrics
+
+    results = [{"duration": 200, "instrumental": False, "syncedLyrics": "x", "plainLyrics": "x"}]
+    assert lyrics.best_match(results, duration_s=None) is None
+
+
+def test_lyrics_cache_round_trips_and_force_bypasses_it():
+    # Hand-rolled save/restore rather than a mocking framework — this file
+    # has neither pytest nor monkeypatch, see the module docstring.
+    import lyrics
+
+    calls = {"n": 0}
+
+    def fake_search(track_name, artist_name):
+        calls["n"] += 1
+        return [{"duration": 100, "instrumental": False, "syncedLyrics": "[00:01.00]placeholder",
+                  "plainLyrics": "placeholder"}]
+
+    orig_search = lyrics._search
+    lyrics._search = fake_search
+    try:
+        with db.writing() as conn:
+            conn.execute(
+                "INSERT INTO sources (source_key, extractor, source_id, canonical_url, refreshed_at)"
+                " VALUES (?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING",
+                ("test:lyrics-cache", "test", "lyrics-cache", "https://x", db.now()),
+            )
+
+        row1 = lyrics.get_or_fetch("test:lyrics-cache", "t", "a", 100, force=False)
+        assert row1["found"] == 1 and calls["n"] == 1
+
+        lyrics.get_or_fetch("test:lyrics-cache", "t", "a", 100, force=False)
+        assert calls["n"] == 1, "a second call without force should read the cache, not re-query LRCLIB"
+
+        lyrics.get_or_fetch("test:lyrics-cache", "t", "a", 100, force=True)
+        assert calls["n"] == 2, "force=True must bypass the cache"
+    finally:
+        lyrics._search = orig_search
+
+
 def test_delete_item_cascades_into_playlists():
     import main
 

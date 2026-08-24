@@ -88,7 +88,7 @@ async function downloadFile(dir, spec, onProgress, token) {
   }
 }
 
-async function download(itemId, files, token) {
+async function download(itemId, files, token, { sweep = true, kind } = {}) {
   const dir = await itemDir(itemId, true);
   const written = [];
   for (const spec of files) {
@@ -96,19 +96,28 @@ async function download(itemId, files, token) {
       await downloadFile(
         dir,
         spec,
-        (done, total) => self.postMessage({ type: 'progress', itemId, file: spec.name, done, total }),
+        (done, total) => self.postMessage({ type: 'progress', itemId, file: spec.name, done, total, kind }),
         token,
       ),
     );
   }
 
-  // Re-downloading at a different profile writes audio.mp3 next to the old
-  // audio.m4a, and nothing references the old one again — it just sits there
-  // consuming the storage the user is trying to budget. Anything not in the
-  // manifest we just wrote is stale, including abandoned .part files.
-  const keep = new Set(written.map((f) => f.name));
-  for await (const name of dir.keys()) {
-    if (!keep.has(name)) await dir.removeEntry(name).catch(() => {});
+  if (sweep) {
+    // Re-downloading at a different profile writes audio.mp3 next to the old
+    // audio.m4a, and nothing references the old one again — it just sits there
+    // consuming the storage the user is trying to budget. Anything not in the
+    // manifest we just wrote is stale, including abandoned .part files.
+    //
+    // lyrics.* is excluded on purpose: it's never part of an audio job's own
+    // manifest (server/pipeline.py only ever emits audio.*/art*.jpg), so an
+    // ordinary re-download would otherwise delete a lyrics file it knows
+    // nothing about. A lyrics-only download (see below) skips this loop
+    // entirely via sweep:false, so the reverse — deleting audio/art because
+    // they're absent from a single-file lyrics manifest — can't happen either.
+    const keep = new Set(written.map((f) => f.name));
+    for await (const name of dir.keys()) {
+      if (!keep.has(name) && !name.startsWith('lyrics')) await dir.removeEntry(name).catch(() => {});
+    }
   }
   return written;
 }
@@ -161,10 +170,11 @@ self.onmessage = async ({ data }) => {
       self.postMessage({
         type: 'done',
         itemId: data.itemId,
-        files: await download(data.itemId, data.files, data.token),
+        kind: data.kind,
+        files: await download(data.itemId, data.files, data.token, { sweep: data.sweep !== false, kind: data.kind }),
       });
     }
   } catch (err) {
-    self.postMessage({ type: 'error', itemId: data.itemId, error: String(err) });
+    self.postMessage({ type: 'error', itemId: data.itemId, kind: data.kind, error: String(err) });
   }
 };

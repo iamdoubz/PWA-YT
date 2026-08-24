@@ -36,6 +36,8 @@
       ],
     },
     playlists: { shapes: [{ d: 'M4 6h16M4 12h16M4 18h10' }] },
+    // lines of decreasing length, distinct from playlists' equal-width bars
+    lyrics: { shapes: [{ d: 'M4 6h16M4 12h12M4 18h8' }] },
     account: {
       shapes: [
         { tag: 'circle', cx: 12, cy: 8, r: 3.6 },
