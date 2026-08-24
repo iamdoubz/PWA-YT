@@ -244,6 +244,7 @@ def run(url: str, profile: dict, scratch_dir: str, cookies_text: str | None = No
         # catalogue row with whatever was actually found here.
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
+        "duration_s": round(info["duration"]) if info.get("duration") is not None else None,
         "files": [
             {"name": n, "bytes": (scratch / n).stat().st_size, "sha256": _sha256(scratch / n)}
             for n in names

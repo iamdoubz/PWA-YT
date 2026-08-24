@@ -236,6 +236,47 @@ def test_lyrics_cache_round_trips_and_force_bypasses_it():
         lyrics._search = orig_search
 
 
+def test_finish_backfills_missing_source_fields_independently():
+    # SoundCloud's flat playlist probe leaves title/uploader/duration_s all
+    # NULL (extract.py); the full per-item extraction that runs at download
+    # time is the first point any of them is known. _finish() backfills
+    # sources with whatever's still missing — COALESCE per column, so an
+    # already-correct field never gets clobbered by the same job filling in
+    # a *different* still-missing one.
+    import main
+
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO sources (source_key, extractor, source_id, canonical_url,"
+            " title, uploader, duration_s, refreshed_at) VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(source_key) DO NOTHING",
+            ("test:finish-partial", "test", "finish-partial", "https://x",
+             "Already Correct", "Some Artist", None, db.now()),
+        )
+        item_id = db.uuid7()
+        conn.execute(
+            "INSERT INTO library_items (id, user_id, source_key, format_profile, added_at, updated_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (item_id, db.DEV_USER_ID, "test:finish-partial", "{}", db.now(), db.now()),
+        )
+
+    main._finish(
+        "test-job-finish-partial", item_id, "test:finish-partial",
+        {"copied": True, "title": "Already Correct", "uploader": "Some Artist", "duration_s": 200,
+         "files": [{"name": "audio.m4a", "bytes": 10, "sha256": "a" * 64}]},
+        tempfile.mkdtemp(), db.DEV_USER_ID,
+    )
+
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT title, uploader, duration_s FROM sources WHERE source_key = ?",
+            ("test:finish-partial",),
+        ).fetchone()
+    assert row["title"] == "Already Correct", "an already-correct field must not be overwritten"
+    assert row["uploader"] == "Some Artist"
+    assert row["duration_s"] == 200, "the still-missing field must get backfilled"
+
+
 def test_delete_item_cascades_into_playlists():
     import main
 

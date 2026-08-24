@@ -264,20 +264,29 @@ def _finish(
                 job_id,
             ),
         )
-        # extract.py's flat playlist probe leaves title/uploader blank for
-        # extractors (SoundCloud) that don't report them in flat mode — this
-        # is the first point a full per-item extraction has run, so backfill
-        # `sources` (where title/uploader actually live — see db.py) if
-        # resolve-time left it empty. `library_items.updated_at` only gets
-        # touched when that backfill actually changed something, which is
-        # what gets the corrected title to other devices over /sync (D-020's
-        # cursor compares library_items.updated_at, not sources) without
-        # bumping rows that were already correct.
-        if result.get("title"):
+        # extract.py's flat playlist probe leaves title/uploader/duration_s
+        # blank for extractors (SoundCloud) that don't report them in flat
+        # mode — this is the first point a full per-item extraction has run,
+        # so backfill `sources` (where these actually live — see db.py) for
+        # whichever of the three resolve-time left empty. COALESCE keeps
+        # each field independently: a track whose title was already right
+        # but whose duration wasn't (or vice versa) doesn't get the other
+        # field clobbered. `library_items.updated_at` only gets touched when
+        # the backfill actually changed something, which is what gets the
+        # correction to other devices over /sync (D-020's cursor compares
+        # library_items.updated_at, not sources) without bumping rows that
+        # were already correct.
+        if result.get("title") or result.get("duration_s") is not None:
             changed = conn.execute(
-                """UPDATE sources SET title=?, uploader=?, refreshed_at=?
-                    WHERE source_key=? AND (title IS NULL OR title = '')""",
-                (result["title"], result.get("uploader"), db.now(), source_key),
+                """UPDATE sources SET
+                     title = COALESCE(NULLIF(title, ''), ?),
+                     uploader = COALESCE(NULLIF(uploader, ''), ?),
+                     duration_s = COALESCE(duration_s, ?),
+                     refreshed_at = ?
+                   WHERE source_key = ?
+                     AND (title IS NULL OR title = '' OR duration_s IS NULL)""",
+                (result.get("title"), result.get("uploader"), result.get("duration_s"),
+                 db.now(), source_key),
             ).rowcount
             if changed:
                 conn.execute(
@@ -543,7 +552,7 @@ _enable_docs = os.environ.get("PWA_YT_ENABLE_DOCS", "").lower() in ("1", "true",
 
 app = FastAPI(
     title="PWA-YT",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
     docs_url="/docs" if _enable_docs else None,
     redoc_url="/redoc" if _enable_docs else None,
