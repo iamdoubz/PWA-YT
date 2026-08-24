@@ -1,5 +1,7 @@
 <script>
   import { onMount } from 'svelte';
+  import { fly, fade } from 'svelte/transition';
+  import { cubicOut, cubicIn } from 'svelte/easing';
   import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
   import { generateKeyBetween, generateNKeysBetween } from 'fractional-indexing';
   import * as db from './db.svelte.js';
@@ -9,6 +11,7 @@
   import * as outbox from './outbox.js';
   import * as sync from './sync.js';
   import { uuid7 } from './id.js';
+  import Icon from './Icon.svelte';
 
   const ACTIVE = ['queued', 'fetching', 'transforming', 'ready'];
   const STAGE = {
@@ -88,6 +91,47 @@
   let cookiesBusy = $state(false);
   let cookiesMessage = $state(null);
 
+  // ---- UI-only state (this redesign pass). None of this touches the
+  // sync/outbox/OPFS machinery — it only decides what's on screen. (Theme is
+  // the one exception that persists, to localStorage — see setTheme below.)
+  let sheet = $state(null); // null | 'add' | 'account'
+  let playerExpanded = $state(false); // mini-player vs. full player sheet
+  let openMenuItemId = $state(null); // which row's kebab menu is open (item or playlist id)
+
+  // Dark is the default (D-029). A light choice is read back from the
+  // `data-theme` attribute an inline script in index.html already set
+  // before first paint (from the same localStorage key setTheme writes),
+  // so this never fights that pre-paint value or causes its own flash.
+  let theme = $state(
+    typeof document !== 'undefined' && document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+  );
+  function setTheme(next) {
+    theme = next;
+    if (next === 'light') document.documentElement.dataset.theme = 'light';
+    else delete document.documentElement.dataset.theme;
+    const meta = document.getElementById('theme-color-meta');
+    if (meta) meta.content = next === 'light' ? '#fafaf9' : '#0b0b0c';
+    try {
+      localStorage.setItem('pwa-yt-theme', next);
+    } catch {
+      /* private browsing or storage disabled — theme just won't survive a reload */
+    }
+  }
+
+  const prefersReducedMotion =
+    typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const sheetEnter = { y: 24, duration: prefersReducedMotion ? 0 : 220, easing: cubicOut };
+  const sheetExit = { y: 24, duration: prefersReducedMotion ? 0 : 160, easing: cubicIn };
+  const backdropEnter = { duration: prefersReducedMotion ? 0 : 200 };
+  const backdropExit = { duration: prefersReducedMotion ? 0 : 150 };
+
+  function closeAddSheet() {
+    sheet = null;
+    plan = null;
+    planError = null;
+    playlistImport = null;
+  }
+
   let audio; // ONE element for the app's lifetime. FM-5: a fresh element per
   // track loses the iOS gesture unlock and playback dies once backgrounded.
   let worker;
@@ -98,6 +142,10 @@
   // "downloaded" means the bytes are here, not that a row once claimed they were.
   const downloaded = $derived(items.filter((i) => media[i.id]?.state === 'present'));
   const verified = $derived(downloaded.filter((i) => media[i.id]?.verified_at).length);
+  // One glance at the account avatar badge: persisted, shell cached, nothing
+  // known-missing. A rollup for the badge only — the account sheet's own
+  // diagnostics list is what tells the full, honest story per D-002/FM-6.
+  const readinessOk = $derived(persisted === true && shellCached && items.length - downloaded.length <= 0);
 
   const activePlaylists = $derived(
     playlists.filter((p) => !p.deleted_at).sort((a, b) => a.created_at.localeCompare(b.created_at)),
@@ -395,6 +443,7 @@
     readOnly = false;
     api.setAuthToken(null);
     stopPolling();
+    sheet = null;
   }
 
   // ------------------------------------------------------------------ adding
@@ -453,6 +502,7 @@
       await db.put('items', row);
       items = [row, ...items.filter((i) => i.id !== row.id)];
       urlInput = '';
+      sheet = null;
       startPolling();
     } catch (err) {
       planError = err.message;
@@ -511,6 +561,7 @@
         playlistItems = [...playlistItems, piRow];
       }
       urlInput = '';
+      sheet = null;
       openPlaylistId = playlistId;
       view = 'playlists';
       startPolling();
@@ -908,6 +959,7 @@
     audio.removeAttribute('src');
     audio.load();
     playingId = null;
+    playerExpanded = false;
   }
 
   function step(delta) {
@@ -1027,34 +1079,48 @@
   }}
 ></audio>
 
-<main>
-  <h1>PWA-YT <span class="ver">v0.4</span></h1>
+<!-- svelte:window must live at the template's top level, unconditionally, so
+     it can't sit inside the signed-in {#if} branch below. -->
+<svelte:window
+  onclick={(e) => {
+    if (!e.target.closest('.item-menu')) openMenuItemId = null;
+  }}
+  onkeydown={(e) => {
+    if (e.key !== 'Escape') return;
+    if (openMenuItemId) openMenuItemId = null;
+    else if (playerExpanded) playerExpanded = false;
+    else if (sheet) sheet = null;
+  }}
+/>
 
-  {#if !booted}
+{#if !booted}
+  <div class="boot-screen">
+    <span class="spinner lg"></span>
     <p class="dim">Reading local catalogue…</p>
-  {:else if !session}
-    <!-- Usernameless: no username/email field here at all. The authenticator's
-         own passkey picker is the entire sign-in UI. -->
-    <section class="auth">
-      {#if authError}<p class="err">{authError}</p>{/if}
+  </div>
+{:else if !session}
+  <!-- Usernameless: no username/email field here at all. The authenticator's
+       own passkey picker is the entire sign-in UI. -->
+  <div class="auth-screen">
+    <div class="auth-card">
+      <div class="brand">
+        <span class="brand-mark"><Icon name="library" size={22} /></span>
+        <span class="brand-name">PWA-YT</span>
+      </div>
+      {#if authError}<p class="row-err center">{authError}</p>{/if}
       {#if authView === 'register'}
         <h2>Create your account</h2>
         <input placeholder="Invite code" bind:value={inviteCode} aria-label="Invite code" />
-        <input
-          type="email"
-          placeholder="Email"
-          bind:value={authEmail}
-          aria-label="Email"
-        />
+        <input type="email" placeholder="Email" bind:value={authEmail} aria-label="Email" />
         <input
           placeholder="Display name (optional)"
           bind:value={authDisplayName}
           aria-label="Display name"
         />
-        <button onclick={doRegister} disabled={authBusy || !inviteCode.trim() || !authEmail.trim()}>
+        <button class="btn accent wide" onclick={doRegister} disabled={authBusy || !inviteCode.trim() || !authEmail.trim()}>
           {authBusy ? 'Creating…' : 'Create account with a passkey'}
         </button>
-        <button class="ghost" onclick={() => (authView = 'login')}>
+        <button class="link-btn" onclick={() => (authView = 'login')}>
           Already have an account? Sign in
         </button>
       {:else if magicLinkView}
@@ -1062,18 +1128,13 @@
         {#if magicLinkMessage}
           <p class="dim">{magicLinkMessage}</p>
         {:else}
-          <input
-            type="email"
-            placeholder="Email"
-            bind:value={magicLinkEmail}
-            aria-label="Email"
-          />
-          <button onclick={doMagicLinkRequest} disabled={authBusy || !magicLinkEmail.trim()}>
+          <input type="email" placeholder="Email" bind:value={magicLinkEmail} aria-label="Email" />
+          <button class="btn accent wide" onclick={doMagicLinkRequest} disabled={authBusy || !magicLinkEmail.trim()}>
             {authBusy ? 'Sending…' : 'Send sign-in link'}
           </button>
         {/if}
         <button
-          class="ghost"
+          class="link-btn"
           onclick={() => {
             magicLinkView = false;
             magicLinkMessage = null;
@@ -1083,584 +1144,1073 @@
         </button>
       {:else}
         <h2>Sign in</h2>
-        <button onclick={doLogin} disabled={authBusy}>
+        <button class="btn accent wide" onclick={doLogin} disabled={authBusy}>
           {authBusy ? 'Signing in…' : 'Sign in with a passkey'}
         </button>
-        <button class="ghost" onclick={() => (authView = 'register')}>
+        <button class="link-btn" onclick={() => (authView = 'register')}>
           Have an invite code? Register
         </button>
-        <button class="ghost" onclick={() => (magicLinkView = true)}>
+        <button class="link-btn" onclick={() => (magicLinkView = true)}>
           Lost your passkey? Email me a sign-in link
         </button>
       {/if}
-    </section>
-  {:else}
-    {#if readOnly}
-      <p class="err">
-        Session expired — sign in again once you're back online. Your library
-        is still here either way; nothing local was touched.
-      </p>
-    {/if}
-    <div class="row account">
-      <span class="dim">{session.user.display_name || session.user.email}</span>
-      <button class="ghost" onclick={doLogout}>Sign out</button>
     </div>
-
-    <details class="format">
-      <summary class="dim">
-        Account
-        {#if usage}
-          · {gb(usage.bytes_used_today)} of {gb(usage.daily_byte_budget)} used today
-        {/if}
-      </summary>
-      <p class="dim">
-        {#if usage}
-          {usage.active_jobs} active job{usage.active_jobs === 1 ? '' : 's'} ·
-          {gb(usage.remaining_bytes)} left today
-        {:else}
-          Usage — …
-        {/if}
-      </p>
-      <p class="dim">
-        Cookies for private or age-restricted content
-        {#if cookiesInfo?.configured}
-          — configured {when(cookiesInfo.updated_at)}
-        {:else if cookiesInfo}
-          — not configured
-        {/if}
-        . Exported from a browser extension, Netscape format. Stored
-        encrypted; never shown back once saved.
-      </p>
-      <textarea
-        rows="3"
-        placeholder="Paste a cookies.txt export here"
-        bind:value={cookiesText}
-        aria-label="Cookies"
-      ></textarea>
-      <div class="row">
-        <button onclick={saveCookies} disabled={cookiesBusy || !cookiesText.trim()}>
-          {cookiesBusy ? 'Saving…' : 'Save cookies'}
-        </button>
-        {#if cookiesInfo?.configured}
-          <button class="ghost" onclick={clearCookies} disabled={cookiesBusy}>Clear</button>
-        {/if}
-      </div>
-      {#if cookiesMessage}<p class="dim">{cookiesMessage}</p>{/if}
-    </details>
-
-  <form
-    class="add"
-    onsubmit={(e) => {
-      e.preventDefault();
-      doResolve();
-    }}
-  >
-    <input
-      type="url"
-      bind:value={urlInput}
-      placeholder="Paste a YouTube link"
-      aria-label="Media URL"
-    />
-    <button type="submit" disabled={resolving || !urlInput.trim()}>
-      {resolving ? 'Looking…' : 'Look up'}
-    </button>
-  </form>
-
-  <details class="format">
-    <summary class="dim">
-      Format: {profile.audio_codec.toUpperCase()} {profile.audio_bitrate} kbps{profile.save_artwork
-        ? ' · artwork'
-        : ''}
-    </summary>
-    <div class="row">
-      <label>
-        Codec
-        <select bind:value={profile.audio_codec}>
-          <option value="aac">AAC</option>
-          <option value="mp3">MP3</option>
-        </select>
-      </label>
-      <label>
-        Bitrate
-        <select bind:value={profile.audio_bitrate}>
-          <option value={128}>128</option>
-          <option value={192}>192</option>
-          <option value={256}>256</option>
-        </select>
-      </label>
-      <label class="check">
-        <input type="checkbox" bind:checked={profile.save_artwork} /> Artwork
-      </label>
-    </div>
-    <p class="dim">
-      Stored per item. Re-adding a track at a different setting re-pulls it at
-      that setting. A bitrate above what the source offers is ignored — raising
-      it cannot add back what the original encoder discarded.
-    </p>
-  </details>
-
-  {#if planError}
-    <p class="err">{planError}</p>
-  {/if}
-
-  {#if plan}
-    <!-- Stage 3: confirm. The user sees what it is and what it will cost
-         before anything is committed to their phone. -->
-    <section class="plan">
-      <strong>{plan.title}</strong>
-      <span class="dim">{plan.uploader} · {clock(plan.duration_s)}</span>
-      <span class="dim">~{mb(plan.estimated_bytes)} (estimate)</span>
-      {#if plan.already_in_library}
-        <span class="dim">Already in your library — this will re-download it.</span>
-      {/if}
-      <div class="actions">
-        <button onclick={confirmAdd}>Download</button>
-        <button class="ghost" onclick={() => (plan = null)}>Cancel</button>
-      </div>
-    </section>
-  {/if}
-
-  {#if playlistImport}
-    <!-- Entries stream in as yt-dlp's flat enumeration produces them, so a
-         400-entry playlist starts rendering well before it finishes. -->
-    <section class="plan">
-      <input
-        class="playlist-title"
-        bind:value={playlistImport.title}
-        aria-label="Playlist name"
-      />
-      <span class="dim">
-        {playlistImport.entries.length}{playlistImport.done
-          ? ''
-          : ` of ${playlistImport.entryCount}`} tracks found{playlistImport.done ? '' : ' · resolving…'}
+  </div>
+{:else}
+  <div class="app-shell">
+    <header class="topbar">
+      <span class="wordmark">
+        <Icon name="library" size={18} />
+        PWA-YT
       </span>
-      <span class="dim">{importSelected.length} selected · ~{mb(importSelectedBytes)} (estimate)</span>
-      <ul class="import-list">
-        {#each playlistImport.entries as e (e.source_key)}
-          <li>
-            <label>
-              <input
-                type="checkbox"
-                checked={!playlistImport.deselected[e.source_key]}
-                onchange={() => toggleImportEntry(e.source_key)}
-              />
-              <span class="title">{e.title ?? e.source_key}</span>
-              <span class="dim">
-                {clock(e.duration_s)}{e.already_in_library ? ' · already in library' : ''}
-              </span>
-            </label>
-          </li>
-        {/each}
-      </ul>
-      <div class="actions">
-        <button onclick={confirmPlaylistImport} disabled={!importSelected.length}>
-          Import {importSelected.length} track{importSelected.length === 1 ? '' : 's'}
-        </button>
-        <button class="ghost" onclick={() => (playlistImport = null)}>Cancel</button>
-      </div>
-    </section>
-  {/if}
-
-    <div class="tabs">
-      <button class:active={view === 'library'} onclick={() => (view = 'library')}>Library</button>
-      <button class:active={view === 'playlists'} onclick={() => (view = 'playlists')}>
-        Playlists{activePlaylists.length ? ` (${activePlaylists.length})` : ''}
-      </button>
-    </div>
-
-    {#if view === 'library'}
-      <ul class="library">
-        {#each items as item (item.id)}
-          {@const job = jobs[item.id]}
-          {@const pct = progress[item.id]}
-          <li class:active={playingId === item.id}>
-            <div class="art">
-              {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
-            </div>
-            <div class="meta">
-              <strong>{item.title}</strong>
-              <span class="dim">
-                {item.uploader} · {clock(item.duration_s)}
-                {#if media[item.id]?.state === 'missing'} · not downloaded{/if}
-              </span>
-              {#if errors[item.id]}<span class="err">{errors[item.id]}</span>{/if}
-            </div>
-            <div class="actions">
-              {#if pct !== undefined}
-                <span class="dim">{Math.round(pct * 100)}% to device</span>
-              {:else if media[item.id]?.state === 'present'}
-                <button onclick={() => play(item, null)}>Play</button>
-                <button class="ghost" onclick={() => forget(item)}>Delete</button>
-              {:else if job && ACTIVE.includes(job.state)}
-                <span class="dim">
-                  {STAGE[job.state]}{job.progress ? ` ${Math.round(job.progress * 100)}%` : ''}…
-                </span>
-              {:else if job?.state === 'failed'}
-                <button onclick={() => retry(item)}>Retry</button>
-                <button class="ghost" onclick={() => forget(item)}>Delete</button>
-              {:else}
-                <button onclick={() => redownload(item)}>Download</button>
-                <button class="ghost" onclick={() => forget(item)}>Delete</button>
-              {/if}
-              {#if activePlaylists.length}
-                <select
-                  class="add-to-playlist"
-                  aria-label="Add to playlist"
-                  onchange={(e) => {
-                    const pl = activePlaylists.find((p) => p.id === e.currentTarget.value);
-                    e.currentTarget.value = '';
-                    if (pl) addToPlaylist(pl, item);
-                  }}
-                >
-                  <option value="" disabled selected>Add to…</option>
-                  {#each activePlaylists as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
-                </select>
-              {/if}
-            </div>
-          </li>
-        {:else}
-          <li class="empty dim">Nothing here yet. Paste a link above.</li>
-        {/each}
-      </ul>
-    {:else if !openPlaylist}
-      <form
-        class="add"
-        onsubmit={(e) => {
-          e.preventDefault();
-          createPlaylistLocal();
-        }}
+      <button
+        class="avatar-btn"
+        onclick={() => (sheet = sheet === 'account' ? null : 'account')}
+        aria-label={`Account. Offline readiness ${readinessOk ? 'ready' : 'needs attention'}.`}
       >
-        <input bind:value={newPlaylistName} placeholder="New playlist name" aria-label="Playlist name" />
-        <button type="submit" disabled={!newPlaylistName.trim()}>Create</button>
-      </form>
-      <ul class="library">
-        {#each activePlaylists as p (p.id)}
-          <li>
-            <div
-              class="meta"
-              onclick={() => (openPlaylistId = p.id)}
-              onkeydown={(e) => e.key === 'Enter' && (openPlaylistId = p.id)}
-              role="button"
-              tabindex="0"
-            >
-              <strong>{p.name}</strong>
-              <span class="dim">{orderedPlaylistItems(p.id).length} tracks</span>
-            </div>
-            <div class="actions">
-              <button
-                class="ghost"
-                onclick={() => {
-                  editingPlaylistId = p.id;
-                  editingName = p.name;
-                }}
-              >
-                Rename
-              </button>
-              <button class="ghost" onclick={() => deletePlaylistLocal(p)}>Delete</button>
-            </div>
-          </li>
-          {#if editingPlaylistId === p.id}
-            <li>
-              <form
-                class="add"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  renamePlaylistLocal(p, editingName);
-                  editingPlaylistId = null;
-                }}
-              >
-                <input bind:value={editingName} aria-label="Rename playlist" />
-                <button type="submit">Save</button>
-                <button type="button" class="ghost" onclick={() => (editingPlaylistId = null)}>
-                  Cancel
-                </button>
-              </form>
-            </li>
-          {/if}
-        {:else}
-          <li class="empty dim">No playlists yet.</li>
-        {/each}
-      </ul>
-    {:else}
-      <div class="row">
-        <button class="ghost" onclick={() => (openPlaylistId = null)}>‹ Playlists</button>
-        <strong>{openPlaylist.name}</strong>
-        <button class="ghost" onclick={() => deletePlaylistLocal(openPlaylist)}>Delete</button>
-      </div>
-      <ul class="library">
-        {#each openPlaylistTracks as item, i (item.id)}
-          <li class:active={playingId === item.id}>
-            <div class="art">
-              {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
-            </div>
-            <div class="meta">
-              <strong>{item.title}</strong>
-              <span class="dim">
-                {item.uploader} · {clock(item.duration_s)}
-                {#if media[item.id]?.state !== 'present'} · not downloaded{/if}
-              </span>
-            </div>
-            <div class="actions">
-              <button onclick={() => moveInPlaylist(openPlaylist, item, -1)} disabled={i === 0}>↑</button>
-              <button onclick={() => moveInPlaylist(openPlaylist, item, 1)} disabled={i === openPlaylistTracks.length - 1}>
-                ↓
-              </button>
-              {#if media[item.id]?.state === 'present'}
-                <button onclick={() => play(item, openPlaylist.id)}>Play</button>
-              {/if}
-              <button class="ghost" onclick={() => removeFromPlaylist(openPlaylist, item)}>Remove</button>
-            </div>
-          </li>
-        {:else}
-          <li class="empty dim">No tracks yet — add some from the Library tab.</li>
-        {/each}
-      </ul>
-    {/if}
+        <Icon name="account" size={20} />
+        <span class="status-badge" class:ok={readinessOk} class:warn={!readinessOk}></span>
+      </button>
+    </header>
 
-    {#if playing}
-      <section class="player">
-        <strong>{playing.title}</strong>
-        <input
-          type="range"
-          min="0"
-          max={duration || 0}
-          value={at}
-          step="0.1"
-          oninput={(e) => {
-            audio.currentTime = Number(e.currentTarget.value);
-            pushPositionState();
-          }}
-          aria-label="Seek"
-        />
-        <div class="row">
-          <span class="dim">{clock(at)} / {clock(duration)}</span>
+    <main class="content">
+      {#if readOnly}
+        <div class="banner warn">
+          <Icon name="alert-triangle" size={18} />
           <span>
-            <button onclick={() => step(-1)}>‹‹</button>
-            <button onclick={() => (paused ? audio.play() : audio.pause())}>
-              {paused ? '▶' : '❚❚'}
-            </button>
-            <button onclick={() => step(1)}>››</button>
+            Session expired — sign in again once you're back online. Your library
+            is still here either way; nothing local was touched.
           </span>
         </div>
-      </section>
-    {/if}
+      {/if}
 
-    <section class="readiness">
-      <h2>Offline readiness</h2>
-      <dl>
-        <dt>App shell</dt>
-        <dd class:bad={!shellCached}>
-          {shellCached ? 'cached' : 'NOT CACHED — reload once'} · built {BUILD}
-        </dd>
-        <dt>Library</dt>
-        <dd>
-          {items.length} items · {downloaded.length} downloaded · {verified} verified
-          {#if items.length - downloaded.length > 0}
-            <span class="bad">· {items.length - downloaded.length} missing</span>
-          {/if}
-        </dd>
-        <dt>Storage used</dt>
-        <dd>
-          {storage ? `${gb(storage.usage)} of ${gb(storage.quota)} available` : '…'}
-        </dd>
-        <dt>Persistent storage</dt>
-        <dd class:bad={persisted === false}>
-          {persisted === null ? '…' : persisted ? 'granted' : 'DENIED'}
-        </dd>
-        <dt>OPFS <code>move()</code></dt>
-        <dd>
-          {moveSupported === null
-            ? 'unknown — download something'
-            : moveSupported
-              ? 'supported'
-              : 'UNSUPPORTED — files kept as .part'}
-        </dd>
-        <dt>Lock-screen controls</dt>
-        <dd class:bad={Object.values(mediaActions).some((v) => !v)}>
-          {Object.entries(mediaActions)
-            .filter(([, ok]) => !ok)
-            .map(([a]) => a)
-            .join(', ') || 'all registered'}
-        </dd>
-        <dt>Last sync</dt>
-        <dd>{lastSync ? when(lastSync) : 'never'}</dd>
-        <dt>Last checked</dt>
-        <dd>{lastVerify ? when(lastVerify) : 'never'}</dd>
-        <dt>Network calls</dt>
-        <dd>{net.ok} ok / {net.fail} failed</dd>
-      </dl>
+      {#if view === 'library'}
+        <ul class="track-list">
+          {#each items as item (item.id)}
+            {@const job = jobs[item.id]}
+            {@const pct = progress[item.id]}
+            <li class="track" class:active={playingId === item.id}>
+              <button
+                class="track-tap"
+                onclick={() => media[item.id]?.state === 'present' && play(item, null)}
+                aria-label={`Play ${item.title}`}
+              >
+                <span class="art">
+                  {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
+                </span>
+                <span class="meta">
+                  <span class="title">{item.title}</span>
+                  <span class="artist">
+                    {item.uploader} · {clock(item.duration_s)}
+                    {#if media[item.id]?.state === 'missing'} · not downloaded{/if}
+                  </span>
+                  {#if errors[item.id]}<span class="row-err">{errors[item.id]}</span>{/if}
+                </span>
+              </button>
 
-      <button class="ghost wide" onclick={runSweep} disabled={!!sweep || !downloaded.length}>
-        {sweep ? `Checking… ${sweep.checked}/${sweep.total}` : 'Check my library'}
-      </button>
+              <span class="track-status">
+                {#if pct !== undefined}
+                  <span class="status-progress" aria-label={`${Math.round(pct * 100)}% downloaded to device`}>
+                    {Math.round(pct * 100)}%
+                  </span>
+                {:else if media[item.id]?.state === 'present'}
+                  <span class="status-icon good" title="Downloaded"><Icon name="check-circle" size={20} /></span>
+                {:else if job && ACTIVE.includes(job.state)}
+                  <span class="spinner" role="status" aria-label={STAGE[job.state]}></span>
+                {:else if job?.state === 'failed'}
+                  <button class="status-icon danger" onclick={() => retry(item)} aria-label="Retry download">
+                    <Icon name="refresh" size={20} />
+                  </button>
+                {:else}
+                  <button class="status-icon warn" onclick={() => redownload(item)} aria-label="Download">
+                    <Icon name="alert-triangle" size={20} />
+                  </button>
+                {/if}
 
-      <p class="dim">
-        "Check my library" re-reads every downloaded file. Run it before you fly,
-        while there is still network to re-download anything that has gone.
-      </p>
-      <p class="dim">
-        Assertion 12: after a cold boot in airplane mode, with no downloads
-        started, "ok" must read 0. Counts main-thread fetch only.
-      </p>
-    </section>
+                <span class="item-menu">
+                  <button
+                    class="icon-btn kebab-btn"
+                    aria-label={`More actions for ${item.title}`}
+                    onclick={() => (openMenuItemId = openMenuItemId === item.id ? null : item.id)}
+                  >
+                    <Icon name="more-vertical" size={20} />
+                  </button>
+                  {#if openMenuItemId === item.id}
+                    <div class="menu-pop" role="menu">
+                      {#each activePlaylists as p (p.id)}
+                        <button
+                          role="menuitem"
+                          onclick={() => {
+                            addToPlaylist(p, item);
+                            openMenuItemId = null;
+                          }}
+                        >
+                          <Icon name="plus" size={16} /> Add to {p.name}
+                        </button>
+                      {:else}
+                        <span class="menu-empty dim">No playlists yet</span>
+                      {/each}
+                      <button
+                        role="menuitem"
+                        class="danger"
+                        onclick={() => {
+                          forget(item);
+                          openMenuItemId = null;
+                        }}
+                      >
+                        <Icon name="trash" size={16} /> Delete
+                      </button>
+                    </div>
+                  {/if}
+                </span>
+              </span>
+            </li>
+          {:else}
+            <li class="empty-state">
+              <p>Nothing downloaded yet.</p>
+              <p class="dim">Tap the + below to add a track from YouTube or SoundCloud.</p>
+            </li>
+          {/each}
+        </ul>
+      {:else if !openPlaylist}
+        <form
+          class="url-form compact"
+          onsubmit={(e) => {
+            e.preventDefault();
+            createPlaylistLocal();
+          }}
+        >
+          <input bind:value={newPlaylistName} placeholder="New playlist name" aria-label="Playlist name" />
+          <button type="submit" class="btn accent" disabled={!newPlaylistName.trim()}>Create</button>
+        </form>
+        <ul class="playlist-grid">
+          {#each activePlaylists as p (p.id)}
+            <li class="playlist-card">
+              {#if editingPlaylistId === p.id}
+                <form
+                  class="url-form compact"
+                  onsubmit={(e) => {
+                    e.preventDefault();
+                    renamePlaylistLocal(p, editingName);
+                    editingPlaylistId = null;
+                  }}
+                >
+                  <input bind:value={editingName} aria-label="Rename playlist" />
+                  <button type="submit" class="btn accent">Save</button>
+                  <button type="button" class="btn ghost" onclick={() => (editingPlaylistId = null)}>Cancel</button>
+                </form>
+              {:else}
+                <button class="playlist-tap" onclick={() => (openPlaylistId = p.id)}>
+                  <span class="playlist-cover"><Icon name="playlists" size={22} /></span>
+                  <span class="meta">
+                    <strong>{p.name}</strong>
+                    <span class="dim">{orderedPlaylistItems(p.id).length} tracks</span>
+                  </span>
+                </button>
+                <span class="item-menu">
+                  <button
+                    class="icon-btn kebab-btn"
+                    aria-label={`More actions for ${p.name}`}
+                    onclick={() => (openMenuItemId = openMenuItemId === p.id ? null : p.id)}
+                  >
+                    <Icon name="more-vertical" size={20} />
+                  </button>
+                  {#if openMenuItemId === p.id}
+                    <div class="menu-pop" role="menu">
+                      <button
+                        role="menuitem"
+                        onclick={() => {
+                          editingPlaylistId = p.id;
+                          editingName = p.name;
+                          openMenuItemId = null;
+                        }}
+                      >
+                        <Icon name="pencil" size={16} /> Rename
+                      </button>
+                      <button
+                        role="menuitem"
+                        class="danger"
+                        onclick={() => {
+                          deletePlaylistLocal(p);
+                          openMenuItemId = null;
+                        }}
+                      >
+                        <Icon name="trash" size={16} /> Delete
+                      </button>
+                    </div>
+                  {/if}
+                </span>
+              {/if}
+            </li>
+          {:else}
+            <li class="empty-state">
+              <p>No playlists yet.</p>
+              <p class="dim">Create one above, or import a whole playlist by pasting its URL.</p>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <div class="detail-header">
+          <button class="icon-btn" onclick={() => (openPlaylistId = null)} aria-label="Back to playlists">
+            <Icon name="chevron-left" />
+          </button>
+          <strong class="detail-title">{openPlaylist.name}</strong>
+          <button class="icon-btn danger" onclick={() => deletePlaylistLocal(openPlaylist)} aria-label="Delete playlist">
+            <Icon name="trash" size={20} />
+          </button>
+        </div>
+        <ul class="track-list">
+          {#each openPlaylistTracks as item, i (item.id)}
+            <li class="track" class:active={playingId === item.id}>
+              <button
+                class="track-tap"
+                onclick={() => media[item.id]?.state === 'present' && play(item, openPlaylist.id)}
+                aria-label={`Play ${item.title}`}
+              >
+                <span class="art">
+                  {#if urls[item.id]?.art}<img src={urls[item.id].art} alt="" />{/if}
+                </span>
+                <span class="meta">
+                  <span class="title">{item.title}</span>
+                  <span class="artist">
+                    {item.uploader} · {clock(item.duration_s)}
+                    {#if media[item.id]?.state !== 'present'} · not downloaded{/if}
+                  </span>
+                </span>
+              </button>
+              <span class="track-status">
+                <button class="icon-btn sm" onclick={() => moveInPlaylist(openPlaylist, item, -1)} disabled={i === 0} aria-label="Move up">
+                  <Icon name="chevron-down" size={18} rotate={180} />
+                </button>
+                <button
+                  class="icon-btn sm"
+                  onclick={() => moveInPlaylist(openPlaylist, item, 1)}
+                  disabled={i === openPlaylistTracks.length - 1}
+                  aria-label="Move down"
+                >
+                  <Icon name="chevron-down" size={18} />
+                </button>
+                {#if media[item.id]?.state === 'present'}
+                  <span class="status-icon good"><Icon name="check-circle" size={18} /></span>
+                {/if}
+                <button class="icon-btn danger" onclick={() => removeFromPlaylist(openPlaylist, item)} aria-label="Remove from playlist">
+                  <Icon name="close" size={18} />
+                </button>
+              </span>
+            </li>
+          {:else}
+            <li class="empty-state">
+              <p>No tracks yet.</p>
+              <p class="dim">Add some from the Library tab.</p>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </main>
+
+    <div class="dock">
+      {#if playing && !playerExpanded}
+        <div class="miniplayer" style={`--pct: ${duration ? (at / duration) * 100 : 0}%`}>
+          <button class="miniplayer-tap" onclick={() => (playerExpanded = true)} aria-label="Expand player">
+            <span class="art small">
+              {#if urls[playing.id]?.art}<img src={urls[playing.id].art} alt="" />{/if}
+            </span>
+            <span class="meta">
+              <span class="title">{playing.title}</span>
+              <span class="artist">{playing.uploader}</span>
+            </span>
+          </button>
+          <button
+            class="icon-btn accent"
+            onclick={() => (paused ? audio.play() : audio.pause())}
+            aria-label={paused ? 'Play' : 'Pause'}
+          >
+            <Icon name={paused ? 'play' : 'pause'} size={20} />
+          </button>
+        </div>
+      {/if}
+
+      <nav class="bottomnav" aria-label="Primary">
+        <button class="nav-item" class:active={view === 'library'} onclick={() => (view = 'library')}>
+          <Icon name="library" size={22} />
+          <span>Library</span>
+        </button>
+        <button class="nav-fab" onclick={() => (sheet = sheet === 'add' ? null : 'add')} aria-label="Add by URL">
+          <Icon name="plus" size={26} />
+        </button>
+        <button class="nav-item" class:active={view === 'playlists'} onclick={() => (view = 'playlists')}>
+          <Icon name="playlists" size={22} />
+          <span>Playlists{activePlaylists.length ? ` (${activePlaylists.length})` : ''}</span>
+        </button>
+      </nav>
+    </div>
+  </div>
+
+  {#if sheet === 'add'}
+    <button class="sheet-backdrop" onclick={closeAddSheet} aria-label="Close" in:fade={backdropEnter} out:fade={backdropExit}></button>
+    <div class="sheet" role="dialog" aria-label="Add music" in:fly={sheetEnter} out:fly={sheetExit}>
+      <div class="sheet-handle-row">
+        <span class="sheet-kicker">Add</span>
+        <button class="icon-btn" onclick={closeAddSheet} aria-label="Close"><Icon name="close" /></button>
+      </div>
+      <div class="sheet-body">
+        <form
+          class="url-form"
+          onsubmit={(e) => {
+            e.preventDefault();
+            doResolve();
+          }}
+        >
+          <span class="url-input-wrap">
+            <Icon name="link" size={18} />
+            <input type="url" bind:value={urlInput} placeholder="Paste a YouTube or SoundCloud link" aria-label="Media URL" />
+          </span>
+          <button type="submit" class="btn accent" disabled={resolving || !urlInput.trim()}>
+            {resolving ? 'Looking…' : 'Look up'}
+          </button>
+        </form>
+
+        <div class="format-chips">
+          <span class="chip-label dim">Format</span>
+          <div class="chip-group">
+            <button type="button" class="chip" class:selected={profile.audio_codec === 'aac'} onclick={() => (profile.audio_codec = 'aac')}>
+              AAC
+            </button>
+            <button type="button" class="chip" class:selected={profile.audio_codec === 'mp3'} onclick={() => (profile.audio_codec = 'mp3')}>
+              MP3
+            </button>
+          </div>
+          <div class="chip-group">
+            {#each [128, 192, 256] as br (br)}
+              <button
+                type="button"
+                class="chip"
+                class:selected={profile.audio_bitrate === br}
+                onclick={() => (profile.audio_bitrate = br)}
+              >
+                {br} kbps
+              </button>
+            {/each}
+          </div>
+          <label class="chip-check">
+            <input type="checkbox" bind:checked={profile.save_artwork} /> Artwork
+          </label>
+          <p class="dim tiny">
+            Stored per item. Re-adding a track at a different setting re-pulls it at that setting.
+          </p>
+        </div>
+
+        {#if planError}<p class="row-err">{planError}</p>{/if}
+
+        {#if plan}
+          <div class="preview-card">
+            <strong>{plan.title}</strong>
+            <span class="dim">{plan.uploader} · {clock(plan.duration_s)}</span>
+            <span class="dim">~{mb(plan.estimated_bytes)} (estimate)</span>
+            {#if plan.already_in_library}
+              <span class="dim">Already in your library — this will re-download it.</span>
+            {/if}
+            <div class="sheet-actions">
+              <button class="btn accent" onclick={confirmAdd}>Download</button>
+              <button class="btn ghost" onclick={() => (plan = null)}>Cancel</button>
+            </div>
+          </div>
+        {/if}
+
+        {#if playlistImport}
+          <div class="preview-card">
+            <input class="playlist-title-input" bind:value={playlistImport.title} aria-label="Playlist name" />
+            <span class="dim">
+              {playlistImport.entries.length}{playlistImport.done ? '' : ` of ${playlistImport.entryCount}`} tracks found{playlistImport.done
+                ? ''
+                : ' · resolving…'}
+            </span>
+            <span class="dim">{importSelected.length} selected · ~{mb(importSelectedBytes)} (estimate)</span>
+            <ul class="import-list">
+              {#each playlistImport.entries as e (e.source_key)}
+                <li>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={!playlistImport.deselected[e.source_key]}
+                      onchange={() => toggleImportEntry(e.source_key)}
+                    />
+                    <span class="title">{e.title ?? e.source_key}</span>
+                    <span class="dim">
+                      {clock(e.duration_s)}{e.already_in_library ? ' · already in library' : ''}
+                    </span>
+                  </label>
+                </li>
+              {/each}
+            </ul>
+            <div class="sheet-actions">
+              <button class="btn accent" onclick={confirmPlaylistImport} disabled={!importSelected.length}>
+                Import {importSelected.length} track{importSelected.length === 1 ? '' : 's'}
+              </button>
+              <button class="btn ghost" onclick={() => (playlistImport = null)}>Cancel</button>
+            </div>
+          </div>
+        {/if}
+      </div>
+    </div>
   {/if}
-</main>
+
+  {#if sheet === 'account'}
+    <button class="sheet-backdrop" onclick={() => (sheet = null)} aria-label="Close" in:fade={backdropEnter} out:fade={backdropExit}></button>
+    <div class="sheet tall" role="dialog" aria-label="Account" in:fly={sheetEnter} out:fly={sheetExit}>
+      <div class="sheet-handle-row">
+        <span class="sheet-kicker">Account</span>
+        <button class="icon-btn" onclick={() => (sheet = null)} aria-label="Close"><Icon name="close" /></button>
+      </div>
+      <div class="sheet-body">
+        <div class="identity-row">
+          <span class="avatar-lg"><Icon name="account" size={22} /></span>
+          <span class="meta">
+            <strong>{session.user.display_name || session.user.email}</strong>
+            <span class="dim">{session.user.email}</span>
+          </span>
+        </div>
+        <button class="btn danger-outline wide" onclick={doLogout}>Sign out</button>
+
+        <h3 class="section-title">Appearance</h3>
+        <div class="chip-group">
+          <button type="button" class="chip" class:selected={theme === 'dark'} onclick={() => setTheme('dark')}>
+            Dark
+          </button>
+          <button type="button" class="chip" class:selected={theme === 'light'} onclick={() => setTheme('light')}>
+            Light
+          </button>
+        </div>
+
+        <h3 class="section-title">Usage today</h3>
+        {#if usage}
+          <div class="meter">
+            <div
+              class="meter-fill"
+              style={`width: ${Math.min(100, (usage.bytes_used_today / Math.max(usage.daily_byte_budget, 1)) * 100)}%`}
+            ></div>
+          </div>
+          <p class="dim tiny">
+            {gb(usage.bytes_used_today)} of {gb(usage.daily_byte_budget)} ·
+            {usage.active_jobs} active job{usage.active_jobs === 1 ? '' : 's'} ·
+            {gb(usage.remaining_bytes)} left
+          </p>
+        {:else}
+          <p class="dim tiny">Loading…</p>
+        {/if}
+
+        <h3 class="section-title">Cookies</h3>
+        <p class="dim tiny">
+          For private or age-restricted content
+          {#if cookiesInfo?.configured}
+            — configured {when(cookiesInfo.updated_at)}
+          {:else if cookiesInfo}
+            — not configured
+          {/if}
+          . Exported from a browser extension, Netscape format. Stored encrypted; never shown back once saved.
+        </p>
+        <textarea rows="3" placeholder="Paste a cookies.txt export here" bind:value={cookiesText} aria-label="Cookies"></textarea>
+        <div class="sheet-actions">
+          <button class="btn" onclick={saveCookies} disabled={cookiesBusy || !cookiesText.trim()}>
+            {cookiesBusy ? 'Saving…' : 'Save cookies'}
+          </button>
+          {#if cookiesInfo?.configured}
+            <button class="btn ghost" onclick={clearCookies} disabled={cookiesBusy}>Clear</button>
+          {/if}
+        </div>
+        {#if cookiesMessage}<p class="dim tiny">{cookiesMessage}</p>{/if}
+
+        <h3 class="section-title">Offline readiness</h3>
+        <dl class="diag">
+          <dt>App shell</dt>
+          <dd class:bad={!shellCached}>{shellCached ? 'cached' : 'NOT CACHED — reload once'} · built {BUILD}</dd>
+          <dt>Library</dt>
+          <dd>
+            {items.length} items · {downloaded.length} downloaded · {verified} verified
+            {#if items.length - downloaded.length > 0}
+              <span class="bad">· {items.length - downloaded.length} missing</span>
+            {/if}
+          </dd>
+          <dt>Storage used</dt>
+          <dd>{storage ? `${gb(storage.usage)} of ${gb(storage.quota)} available` : '…'}</dd>
+          <dt>Persistent storage</dt>
+          <dd class:bad={persisted === false}>{persisted === null ? '…' : persisted ? 'granted' : 'DENIED'}</dd>
+          <dt>OPFS <code>move()</code></dt>
+          <dd>
+            {moveSupported === null ? 'unknown — download something' : moveSupported ? 'supported' : 'UNSUPPORTED — files kept as .part'}
+          </dd>
+          <dt>Lock-screen controls</dt>
+          <dd class:bad={Object.values(mediaActions).some((v) => !v)}>
+            {Object.entries(mediaActions)
+              .filter(([, ok]) => !ok)
+              .map(([a]) => a)
+              .join(', ') || 'all registered'}
+          </dd>
+          <dt>Last sync</dt>
+          <dd>{lastSync ? when(lastSync) : 'never'}</dd>
+          <dt>Last checked</dt>
+          <dd>{lastVerify ? when(lastVerify) : 'never'}</dd>
+          <dt>Network calls</dt>
+          <dd>{net.ok} ok / {net.fail} failed</dd>
+        </dl>
+
+        <button class="btn ghost wide" onclick={runSweep} disabled={!!sweep || !downloaded.length}>
+          {sweep ? `Checking… ${sweep.checked}/${sweep.total}` : 'Check my library'}
+        </button>
+        <p class="dim tiny">
+          "Check my library" re-reads every downloaded file. Run it before you fly, while there is still
+          network to re-download anything that has gone.
+        </p>
+        <p class="dim tiny">
+          Assertion 12: after a cold boot in airplane mode, with no downloads started, "ok" must read 0.
+          Counts main-thread fetch only.
+        </p>
+      </div>
+    </div>
+  {/if}
+
+  {#if playerExpanded && playing}
+    <button class="sheet-backdrop" onclick={() => (playerExpanded = false)} aria-label="Close" in:fade={backdropEnter} out:fade={backdropExit}></button>
+    <div class="sheet player-sheet" role="dialog" aria-label="Now playing" in:fly={sheetEnter} out:fly={sheetExit}>
+      <div class="sheet-handle-row">
+        <button class="icon-btn" onclick={() => (playerExpanded = false)} aria-label="Collapse player">
+          <Icon name="chevron-down" />
+        </button>
+        <span class="sheet-kicker">
+          {(queuePlaylistId && activePlaylists.find((p) => p.id === queuePlaylistId)?.name) || 'Library'}
+        </span>
+        <span class="spacer-44"></span>
+      </div>
+      <div class="player-art">
+        {#if urls[playing.id]?.art}
+          <img src={urls[playing.id].art} alt="" />
+        {:else}
+          <span class="art-fallback"><Icon name="library" size={48} /></span>
+        {/if}
+      </div>
+      <div class="player-meta">
+        <strong class="player-title">{playing.title}</strong>
+        <span class="player-artist dim">{playing.uploader}</span>
+      </div>
+      <input
+        type="range"
+        class="scrubber"
+        min="0"
+        max={duration || 0}
+        value={at}
+        step="0.1"
+        style={`--pct: ${duration ? (at / duration) * 100 : 0}%`}
+        oninput={(e) => {
+          audio.currentTime = Number(e.currentTarget.value);
+          pushPositionState();
+        }}
+        aria-label="Seek"
+      />
+      <div class="player-times dim tiny">
+        <span>{clock(at)}</span>
+        <span>{clock(duration)}</span>
+      </div>
+      <div class="player-transport">
+        <button class="icon-btn lg" onclick={() => step(-1)} aria-label="Previous track">
+          <Icon name="skip-back" size={26} />
+        </button>
+        <button class="icon-btn accent xl" onclick={() => (paused ? audio.play() : audio.pause())} aria-label={paused ? 'Play' : 'Pause'}>
+          <Icon name={paused ? 'play' : 'pause'} size={30} />
+        </button>
+        <button class="icon-btn lg" onclick={() => step(1)} aria-label="Next track">
+          <Icon name="skip-forward" size={26} />
+        </button>
+      </div>
+      {#if errors[playing.id]}<p class="row-err center">{errors[playing.id]}</p>{/if}
+    </div>
+  {/if}
+{/if}
 
 <style>
-  /* ponytail: system font stack, so there is no font to self-host, subset,
-     precache or forget to precache. The rule in docs is "no CDN fonts"; owning
-     zero font files satisfies it more completely than owning the right ones. */
+  /* ---- tokens ------------------------------------------------------------
+     ponytail: system font stack throughout, so there is no font to
+     self-host, subset, precache or forget to precache — the visual quality
+     here comes from color/spacing/radius/motion instead. See D-011.
+
+     Dark is the default (bare :root, no attribute needed) and light is an
+     explicit opt-in via [data-theme='light'] on <html> — set synchronously
+     by an inline script in index.html before first paint (reading the same
+     localStorage key setTheme() below writes to), so there's no flash of
+     the wrong theme. Light isn't dark-inverted: accent/good/warn/danger are
+     all deepened shades of the same hues, not the bright dark-mode values,
+     because the bright versions fail 4.5:1 text contrast on a light
+     background (verified by hand — see D-029 in 08-decisions.md). */
+  :global(:root) {
+    --bg: #0b0b0d;
+    --surface: #17171b;
+    --surface-2: #1f1f25;
+    --border: #2a2a31;
+    --text: #f2f2f4;
+    --text-dim: #a1a1aa;
+    --text-faint: #6e6e78;
+    --accent: #ff6b3d;
+    --accent-ink: #180d06;
+    --accent-soft: rgba(255, 107, 61, 0.14);
+    --accent-glow: rgba(255, 107, 61, 0.35);
+    --good: #35d0a0;
+    --warn: #f4b740;
+    --danger: #fb5b6e;
+    --danger-ink: #1a0508;
+    --glass-bg: rgba(11, 11, 13, 0.85);
+    --warn-soft-bg: rgba(244, 183, 64, 0.12);
+    --warn-soft-text: #f4c869;
+    --warn-soft-border: rgba(244, 183, 64, 0.35);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --topbar-h: 52px;
+    --nav-h: 60px;
+    --miniplayer-h: 64px;
+  }
+  :global([data-theme='light']) {
+    --bg: #fafaf9;
+    --surface: #ffffff;
+    --surface-2: #f1f0ee;
+    --border: #e4e2df;
+    --text: #17171b;
+    --text-dim: #6b6b76;
+    --text-faint: #9a9aa5;
+    --accent: #c2410c;
+    --accent-ink: #fff8f5;
+    --accent-soft: rgba(194, 65, 12, 0.12);
+    --accent-glow: rgba(194, 65, 12, 0.35);
+    --good: #0f766e;
+    --warn: #b45309;
+    --danger: #dc2626;
+    --danger-ink: #fff8f5;
+    --glass-bg: rgba(250, 250, 249, 0.85);
+    --warn-soft-bg: rgba(180, 83, 9, 0.1);
+    --warn-soft-text: #92400e;
+    --warn-soft-border: rgba(180, 83, 9, 0.35);
+  }
+
   :global(body) {
     margin: 0;
-    background: #0b0b0c;
-    color: #e8e8ea;
-    font: 16px/1.5 system-ui, -apple-system, sans-serif;
-    padding-top: env(safe-area-inset-top);
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   }
-  main {
-    max-width: 34rem;
-    margin: 0 auto;
-    padding: 1rem 1rem 8rem;
+
+  @media (prefers-reduced-motion: reduce) {
+    :global(*) {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+    }
   }
-  h1 {
-    font-size: 1.25rem;
-    margin: 0 0 1rem;
-  }
-  h2 {
-    font-size: 0.8rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #8b8b94;
-    margin: 0 0 0.5rem;
-  }
-  .ver {
-    color: #8b8b94;
-    font-weight: 400;
-  }
+
   .dim {
-    color: #8b8b94;
+    color: var(--text-dim);
   }
-  .err {
-    color: #ff8f8f;
-    font-size: 0.85rem;
+  .tiny {
+    font-size: 12px;
+  }
+  .center {
+    text-align: center;
+  }
+  .row-err {
+    color: var(--danger);
+    font-size: 13px;
   }
   .bad {
-    color: #ff8f8f;
+    color: var(--danger);
   }
-  .add {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
+  .spacer-44 {
+    width: 44px;
+    display: inline-block;
   }
-  .add input {
-    flex: 1;
-    min-width: 0;
-    font: inherit;
-    padding: 0 0.75rem;
-    min-height: 44px;
-    border: 1px solid #33333a;
-    border-radius: 6px;
-    background: #16161a;
-    color: inherit;
-  }
-  .plan {
+
+  /* ---- boot / auth --------------------------------------------------- */
+  .boot-screen,
+  .auth-screen {
+    min-height: 100dvh;
     display: flex;
     flex-direction: column;
-    gap: 0.15rem;
-    padding: 0.75rem;
-    margin-bottom: 1rem;
-    background: #16161a;
-    border: 1px solid #33333a;
-    border-radius: 8px;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    box-sizing: border-box;
+    gap: 12px;
   }
-  .plan .actions {
-    margin-top: 0.5rem;
+  .auth-card {
+    width: 100%;
+    max-width: 22rem;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 28px 22px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
   }
-  .playlist-title {
-    font: inherit;
-    font-weight: 600;
-    padding: 0.25rem 0.4rem;
-    margin-bottom: 0.15rem;
-    border: 1px solid transparent;
-    border-radius: 4px;
-    background: transparent;
-    color: inherit;
-  }
-  .playlist-title:hover,
-  .playlist-title:focus {
-    border-color: #33333a;
-    background: #0b0b0c;
-  }
-  .import-list {
-    list-style: none;
-    padding: 0;
-    margin: 0.5rem 0;
-    max-height: 40vh;
-    overflow-y: auto;
-  }
-  .import-list li {
-    padding: 0.3rem 0;
-    border-bottom: 1px solid #232327;
-  }
-  .import-list label {
+  .brand {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 18px;
   }
-  .import-list .title {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .brand-mark {
+    display: inline-flex;
   }
-  .tabs {
-    display: flex;
-    gap: 0.4rem;
-    margin-bottom: 1rem;
+  .auth-card h2 {
+    margin: 0 0 2px;
+    font-size: 20px;
   }
-  .tabs button {
-    background: #16161a;
-    color: #8b8b94;
-  }
-  .tabs button.active {
-    background: #2f6feb;
-    color: #fff;
-  }
-  .add-to-playlist {
+  .auth-card input {
     font: inherit;
     min-height: 44px;
-    max-width: 8rem;
-    background: #232327;
-    color: #c8c8d0;
-    border: 0;
-    border-radius: 6px;
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: inherit;
   }
-  .library {
+  .link-btn {
+    background: none;
+    border: 0;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 13px;
+    min-height: 36px;
+    text-align: left;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  /* ---- app shell -------------------------------------------------------- */
+  .topbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: calc(var(--topbar-h) + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) 16px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--glass-bg);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+    z-index: 20;
+    box-sizing: border-box;
+  }
+  .wordmark {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--text);
+  }
+  .avatar-btn {
+    position: relative;
+    width: 40px;
+    height: 40px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    border: 0;
+    border-radius: 999px;
+    color: var(--text);
+  }
+  .status-badge {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 2px solid var(--bg);
+  }
+  .status-badge.ok {
+    background: var(--good);
+  }
+  .status-badge.warn {
+    background: var(--warn);
+  }
+
+  .content {
+    max-width: 34rem;
+    margin: 0 auto;
+    padding: calc(var(--topbar-h) + env(safe-area-inset-top) + 16px) 16px
+      calc(var(--nav-h) + var(--miniplayer-h) + env(safe-area-inset-bottom) + 24px);
+    box-sizing: border-box;
+  }
+
+  .banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    border-radius: var(--radius-md);
+    font-size: 13px;
+  }
+  .banner.warn {
+    background: var(--warn-soft-bg);
+    color: var(--warn-soft-text);
+    border: 1px solid var(--warn-soft-border);
+  }
+  .banner :global(svg) {
+    flex: none;
+    margin-top: 1px;
+  }
+
+  /* ---- forms / inputs shared across sheets ------------------------------ */
+  .url-form {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .url-form.compact {
+    margin-bottom: 16px;
+  }
+  .url-input-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    min-height: 44px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--text-dim);
+  }
+  .url-input-wrap input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    min-height: 42px;
+  }
+  .url-input-wrap input:focus {
+    outline: none;
+  }
+  .url-form input:not(.url-input-wrap input) {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    padding: 0 14px;
+    min-height: 44px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: inherit;
+  }
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    padding: 10px 12px;
+    margin: 8px 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: inherit;
+    resize: vertical;
+  }
+
+  /* ---- buttons ------------------------------------------------------- */
+  .btn {
+    min-height: 44px;
+    padding: 0 18px;
+    border-radius: 999px;
+    border: 0;
+    font: inherit;
+    font-weight: 600;
+    font-size: 15px;
+    background: var(--surface-2);
+    color: var(--text);
+    transition: transform 100ms ease-out;
+  }
+  .btn.accent {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  .btn.ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+  }
+  .btn.danger-outline {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+  .btn.wide {
+    width: 100%;
+  }
+  .btn:disabled {
+    opacity: 0.45;
+  }
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+  .btn:focus-visible,
+  .link-btn:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .icon-btn {
+    width: 44px;
+    height: 44px;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 0;
+    border-radius: 999px;
+    color: var(--text);
+    transition: background-color 100ms ease-out, transform 100ms ease-out;
+  }
+  .icon-btn.sm {
+    width: 36px;
+    height: 36px;
+  }
+  .icon-btn.lg {
+    width: 56px;
+    height: 56px;
+  }
+  .icon-btn.xl {
+    width: 72px;
+    height: 72px;
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--surface);
+  }
+  .icon-btn:active:not(:disabled) {
+    transform: scale(0.94);
+  }
+  .icon-btn.accent {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  .icon-btn.danger {
+    color: var(--danger);
+  }
+  .icon-btn:disabled {
+    opacity: 0.35;
+  }
+  .icon-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* ---- chips ----------------------------------------------------------- */
+  .format-chips {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+    padding: 12px;
+    background: var(--surface);
+    border-radius: var(--radius-md);
+  }
+  .chip-label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .chip-group {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .chip {
+    min-height: 36px;
+    padding: 0 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .chip.selected {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .chip-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .chip-check input {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* ---- track / playlist lists ------------------------------------------ */
+  .track-list,
+  .playlist-grid {
     list-style: none;
     padding: 0;
-    margin: 0 0 2rem;
+    margin: 0 0 16px;
   }
-  .library li {
+  .track {
+    position: relative;
     display: flex;
-    gap: 0.75rem;
     align-items: center;
-    padding: 0.6rem 0;
-    border-bottom: 1px solid #232327;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
   }
-  .library li.empty {
+  .track-tap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: none;
     border: 0;
+    padding: 6px 0;
+    text-align: left;
+    color: inherit;
+    border-radius: var(--radius-sm);
+    transition: transform 100ms ease-out;
   }
-  .library li.active strong {
-    color: #7fd1ff;
+  .track-tap:active {
+    transform: scale(0.98);
   }
-  .art {
-    width: 48px;
-    height: 48px;
+  .track.active .title {
+    color: var(--accent);
+  }
+  .art,
+  .playlist-cover {
+    width: 46px;
+    height: 46px;
     flex: none;
-    background: #232327;
-    border-radius: 4px;
+    background: var(--surface);
+    border-radius: var(--radius-sm);
     overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-faint);
+  }
+  .art.small {
+    width: 38px;
+    height: 38px;
   }
   .art img {
     width: 100%;
@@ -1673,137 +2223,503 @@
     flex-direction: column;
     min-width: 0;
     flex: 1;
+    gap: 1px;
   }
-  .meta strong {
+  .title {
+    font-weight: 600;
+    font-size: 15px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .actions {
+  .artist {
+    font-size: 13px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .track-status {
     display: flex;
-    gap: 0.4rem;
-    flex: none;
     align-items: center;
+    gap: 4px;
+    flex: none;
   }
-  button {
-    font: inherit;
-    min-height: 44px;
-    padding: 0 0.9rem;
+  .status-icon {
+    width: 36px;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
     border: 0;
-    border-radius: 6px;
-    background: #2f6feb;
-    color: #fff;
+    border-radius: 999px;
   }
-  button:disabled {
-    opacity: 0.5;
+  .status-icon.good {
+    color: var(--good);
   }
-  button.ghost {
-    background: #232327;
-    color: #c8c8d0;
+  .status-icon.warn {
+    color: var(--warn);
   }
-  button.wide {
-    width: 100%;
-    margin: 0.5rem 0;
+  .status-icon.danger {
+    color: var(--danger);
   }
-  .auth {
+  .status-progress {
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    min-width: 34px;
+    text-align: right;
+  }
+  .spinner {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+    display: inline-block;
+  }
+  .spinner.lg {
+    width: 32px;
+    height: 32px;
+    border-width: 3px;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .item-menu {
+    position: relative;
+  }
+  .menu-pop {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    min-width: 190px;
+    max-width: 70vw;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 4px;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    z-index: 50;
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
-    max-width: 22rem;
-    margin: 2rem auto;
-    padding: 1.25rem;
-    background: #16161a;
-    border: 1px solid #33333a;
-    border-radius: 8px;
   }
-  .auth h2 {
-    margin: 0 0 0.25rem;
-  }
-  .auth input {
-    font: inherit;
-    min-height: 44px;
-    padding: 0 0.75rem;
-    border: 1px solid #33333a;
-    border-radius: 6px;
-    background: #0b0b0c;
-    color: inherit;
-  }
-  .format textarea {
-    width: 100%;
-    box-sizing: border-box;
-    font: inherit;
-    padding: 0.5rem 0.75rem;
-    margin: 0.5rem 0;
-    border: 1px solid #33333a;
-    border-radius: 6px;
-    background: #16161a;
-    color: inherit;
-    resize: vertical;
-  }
-  .row.account {
-    justify-content: space-between;
-    margin-bottom: 1rem;
-  }
-  .format {
-    margin-bottom: 1rem;
-  }
-  .format summary {
-    cursor: pointer;
-    min-height: 32px;
-  }
-  .format .row {
-    gap: 1rem;
-    justify-content: flex-start;
-    flex-wrap: wrap;
-    margin: 0.5rem 0;
-  }
-  .format label {
+  .menu-pop button {
     display: flex;
-    gap: 0.4rem;
     align-items: center;
-    color: #8b8b94;
-  }
-  .format select {
+    gap: 8px;
+    text-align: left;
+    background: none;
+    border: 0;
+    color: var(--text);
     font: inherit;
-    min-height: 36px;
-    background: #16161a;
-    color: #e8e8ea;
-    border: 1px solid #33333a;
-    border-radius: 6px;
-    padding: 0 0.4rem;
+    font-size: 14px;
+    padding: 10px 12px;
+    min-height: 40px;
+    border-radius: var(--radius-sm);
   }
-  .format .check input {
-    width: 20px;
-    height: 20px;
+  .menu-pop button:hover,
+  .menu-pop button:focus-visible {
+    background: var(--surface);
   }
-  .player {
+  .menu-pop button.danger {
+    color: var(--danger);
+  }
+  .menu-empty {
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+
+  .empty-state {
+    padding: 48px 12px;
+    text-align: center;
+  }
+  .empty-state p {
+    margin: 4px 0;
+  }
+
+  /* ---- playlist grid / detail -------------------------------------- */
+  .playlist-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .playlist-tap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: none;
+    border: 0;
+    padding: 6px 0;
+    text-align: left;
+    color: inherit;
+  }
+  .playlist-cover {
+    color: var(--accent);
+  }
+  .detail-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .detail-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+    font-size: 16px;
+  }
+
+  /* ---- dock: miniplayer + bottom nav -------------------------------- */
+  .dock {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
-    background: #16161a;
-    border-top: 1px solid #232327;
-    padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom));
-  }
-  .player input[type='range'] {
-    width: 100%;
-    margin: 0.5rem 0;
-  }
-  .row {
+    z-index: 30;
     display: flex;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
   }
-  dl {
+  .miniplayer {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: var(--miniplayer-h);
+    padding: 0 8px 0 12px;
+    background: var(--surface-2);
+    border-top: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .miniplayer::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 2px;
+    width: var(--pct, 0%);
+    background: var(--accent);
+  }
+  .miniplayer-tap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: none;
+    border: 0;
+    color: inherit;
+    text-align: left;
+    padding: 6px 0;
+  }
+  .bottomnav {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-around;
+    height: var(--nav-h);
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    background: var(--surface-2);
+    border-top: 1px solid var(--border);
+    box-sizing: content-box;
+  }
+  .nav-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    min-width: 64px;
+    min-height: 44px;
+    padding: 4px 10px;
+    background: none;
+    border: 0;
+    border-radius: 999px;
+    color: var(--text-dim);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .nav-item.active {
+    color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .nav-fab {
+    width: 52px;
+    height: 52px;
+    margin-top: -18px;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: var(--accent-ink);
+    border: 4px solid var(--bg);
+    border-radius: 999px;
+    box-shadow: 0 4px 14px var(--accent-glow);
+    transition: transform 100ms ease-out;
+  }
+  .nav-fab:active {
+    transform: scale(0.94);
+  }
+  .nav-fab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+
+  /* ---- sheets --------------------------------------------------------- */
+  .sheet-backdrop {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    border: 0;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 90;
+  }
+  .sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: min(88dvh, 720px);
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-2);
+    border-top: 1px solid var(--border);
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+    z-index: 100;
+    box-sizing: border-box;
+  }
+  .sheet.tall {
+    max-height: min(92dvh, 820px);
+  }
+  .sheet-handle-row {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 8px 4px 16px;
+  }
+  .sheet-kicker {
+    font-weight: 700;
+    font-size: 15px;
+  }
+  .sheet-body {
+    overflow-y: auto;
+    padding: 4px 16px 24px;
+  }
+  .sheet-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .section-title {
+    margin: 20px 0 6px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+
+  .identity-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .avatar-lg {
+    width: 44px;
+    height: 44px;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    border-radius: 999px;
+    color: var(--text);
+  }
+  .meter {
+    height: 8px;
+    border-radius: 999px;
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .meter-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+  }
+  .diag {
     display: grid;
     grid-template-columns: auto 1fr;
-    gap: 0.25rem 1rem;
-    margin: 0 0 0.5rem;
+    gap: 6px 12px;
+    margin: 0 0 8px;
+    font-size: 13px;
   }
-  dt {
-    color: #8b8b94;
+  .diag dt {
+    color: var(--text-dim);
   }
-  dd {
+  .diag dd {
     margin: 0;
+  }
+
+  /* ---- preview cards (resolve / playlist import) ------------------- */
+  .preview-card {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 14px;
+    margin-bottom: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .playlist-title-input {
+    font: inherit;
+    font-weight: 700;
+    font-size: 15px;
+    padding: 4px 6px;
+    margin-bottom: 2px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: inherit;
+  }
+  .playlist-title-input:hover,
+  .playlist-title-input:focus {
+    border-color: var(--border);
+    background: var(--bg);
+  }
+  .import-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  .import-list li {
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .import-list label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .import-list input[type='checkbox'] {
+    width: 20px;
+    height: 20px;
+    flex: none;
+  }
+  .import-list .title {
+    flex: 1;
+    min-width: 0;
+    font-weight: 500;
+  }
+
+  /* ---- full player sheet -------------------------------------------- */
+  .player-sheet {
+    align-items: center;
+    padding-bottom: calc(24px + env(safe-area-inset-bottom));
+  }
+  .player-art {
+    width: min(72vw, 320px);
+    height: min(72vw, 320px);
+    margin: 12px 0 20px;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-faint);
+  }
+  .player-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .player-meta {
+    width: 100%;
+    max-width: 26rem;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 24px;
+    box-sizing: border-box;
+    text-align: center;
+  }
+  .player-title {
+    font-size: 19px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .player-artist {
+    font-size: 14px;
+  }
+  .scrubber {
+    width: 100%;
+    max-width: 26rem;
+    margin: 20px 0 4px;
+    padding: 0 24px;
+    box-sizing: border-box;
+    appearance: none;
+    -webkit-appearance: none;
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(to right, var(--accent) var(--pct, 0%), var(--border) var(--pct, 0%));
+  }
+  .scrubber::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--text);
+    margin-top: 0;
+  }
+  .scrubber::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border: 0;
+    border-radius: 50%;
+    background: var(--text);
+  }
+  .scrubber::-moz-range-track {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--border);
+  }
+  .scrubber:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 4px;
+  }
+  .player-times {
+    width: 100%;
+    max-width: 26rem;
+    display: flex;
+    justify-content: space-between;
+    padding: 0 24px;
+    box-sizing: border-box;
+    font-variant-numeric: tabular-nums;
+  }
+  .player-transport {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin: 20px 0 8px;
   }
 </style>

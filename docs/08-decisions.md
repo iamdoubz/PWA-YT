@@ -967,3 +967,60 @@ email got the identical `{ok, message}` response, an immediate second
 request for the same email 429'd on cooldown, and `test_server.py` gained
 three checks for the same paths (round trip + single-use, unknown-email
 silence, cooldown + hourly-cap) — 28 checks total, 0 failures.
+
+---
+
+## D-029 · Light theme added; light is not dark inverted
+
+**Status:** accepted · 2026-08-24
+
+**Decision.** A light theme was added alongside the dark-by-default redesign
+(D-028's session), toggled from the Account sheet ("Appearance") and
+persisted to `localStorage` (key `pwa-yt-theme`), not synced or namespaced
+per account — it's a device preference, not library data. Dark stays the
+default: no attribute means dark, `[data-theme='light']` on `<html>` opts
+in. An inline script in `index.html`, which runs before `main.js` and
+before first paint, reads the same `localStorage` key and sets the
+attribute immediately — this is what avoids a flash of dark before Svelte
+mounts and reads state.
+
+**Light is not just dark's colors inverted.** Naively inverting the dark
+palette (bright orange `#ff6b3d` accent, bright rose `#fb5b6e` danger,
+bright teal `#35d0a0` good, bright amber `#f4b740` warn — all tuned to pop
+against a near-black background) fails outright on a light background:
+hand-computed WCAG contrast (the sRGB relative-luminance formula, not a
+guess) puts `#ff6b3d` on white at roughly 2.2:1 and `#fb5b6e` on white at
+roughly 3.1:1, both well under the 4.5:1 AA floor for normal text — exactly
+the `color-accessible-pairs` failure mode the design brief warned about.
+Light mode instead uses deepened, more saturated shades of the *same* hues
+(`#c2410c`, `#dc2626`, `#0f766e`, `#b45309` — Tailwind's 600/700-ish
+family), each verified by hand to clear 4.5:1 against the light surfaces
+they sit on (`#c2410c` on white: ≈5.2:1; `#dc2626`: ≈4.8:1; `#0f766e`:
+≈5.5:1; `#b45309`: ≈5.0:1). `--accent-ink` (text drawn *on* a solid accent
+fill) flips from near-black to near-white to match, since the light theme's
+accent fill is now the dark element in that pairing.
+
+**Everything routes through the existing CSS custom-property tokens** —
+`App.svelte`'s `:root` block was already fully tokenized (surface, text,
+accent, semantic colors) from the redesign, so adding light mode was a
+second value block (`[data-theme='light']`) plus fixing four places that
+had hardcoded literal colors instead of tokens: `.topbar`'s translucent
+background (now `--glass-bg`), `.banner.warn`'s tint/text/border (now
+`--warn-soft-*`), and `.nav-fab`'s accent-colored glow shadow (now
+`--accent-glow`). The modal backdrop scrim intentionally stays a flat
+`rgba(0,0,0,.55)` in both themes — a black scrim to isolate foreground
+content is standard practice regardless of theme, not a dark-mode leftover.
+
+**Known gap, not fixed:** iOS's `apple-mobile-web-app-status-bar-style:
+black-translucent` (needed for the dark theme's home-screen status bar to
+render light/white icons over the dark topbar) is a static meta tag read
+once at PWA launch — it can't be changed at runtime, and there is no
+supported "auto" value. In light mode this means the status bar's icons
+stay white-on-white over a light topbar, unreadable, on an installed iOS
+home-screen PWA specifically. Not fixed here: the real fix (keeping only
+the `env(safe-area-inset-top)` strip permanently dark regardless of theme,
+so the status bar always has a dark backdrop to draw light icons on) is a
+real chunk of extra layout work for an edge case that only affects
+light-mode users on notched iOS devices, and dark remains this app's
+proven, default, real-device-tested configuration. Revisit if light mode
+turns out to be a commonly chosen mode on iOS home-screen installs.
