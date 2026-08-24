@@ -908,7 +908,16 @@
     // The collection acknowledgement. Best-effort: if it fails the TTL reaper
     // cleans up server-side, which is a backstop rather than the happy path.
     const job = jobs[data.itemId];
-    if (job) api.acknowledge(job.id).catch(() => {});
+    if (job) {
+      api.acknowledge(job.id).catch(() => {});
+      // Title/duration for flat-probed sources (SoundCloud) are only known
+      // after this job's full extraction, and they live in `sources`, which
+      // only reaches this device over /sync — the job stream itself never
+      // carries them. applyJobs() deliberately skips reconcile() per-tick
+      // (too chatty while jobs are active), so a completed job is the one
+      // place that must pull it in, or title/duration stay blank forever.
+      reconcile();
+    }
 
     // FM-6: ask once there is something worth keeping, and show the real
     // answer — a silent false is how libraries disappear.
