@@ -262,6 +262,12 @@
     authError = null;
     startPolling();
     refreshAccountInfo();
+    // The boot-time reconcile() at onMount ran before this session existed
+    // (or before any session existed, if local storage was wiped and this is
+    // a fresh login) and so pulled nothing. Without this, a device that lost
+    // its local catalogue re-authenticates successfully and then just sits
+    // at "0 items" until something else happens to trigger a sync.
+    reconcile();
   }
 
   async function refreshAccountInfo() {
