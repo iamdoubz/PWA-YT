@@ -982,7 +982,18 @@ def get_lyrics_lrc(item_id: str, force: bool = False, user: dict = Depends(auth.
         return error(404, "not_found", "No synced lyrics for this track.")
     return Response(
         content=row["synced"],
-        media_type="text/plain; charset=utf-8",
+        # Not text/plain: Cloudflare (this deployment sits behind a
+        # cloudflared tunnel) auto-compresses compressible content-types on
+        # the fly whenever the client sends Accept-Encoding — which every
+        # browser always does — and a dynamically-compressed response has no
+        # length known in advance, so it drops Content-Length in favour of
+        # Transfer-Encoding: chunked. downloadFile() in opfs-worker.js hard-
+        # requires Content-Length to verify a file on the way to disk.
+        # octet-stream is what audio.m4a/art.jpg already use for exactly
+        # this reason — it's excluded from Cloudflare's compression list, so
+        # Content-Length survives. Confirmed live: text/plain lost the
+        # header once Cloudflare compressed it; audio.m4a never did.
+        media_type="application/octet-stream",
         headers={"X-Lyrics-SHA256": lyrics.sha256_text(row["synced"])},
     )
 
@@ -997,7 +1008,7 @@ def get_lyrics_txt(item_id: str, force: bool = False, user: dict = Depends(auth.
         return error(404, "not_found", "No lyrics for this track.")
     return Response(
         content=row["plain"],
-        media_type="text/plain; charset=utf-8",
+        media_type="application/octet-stream",  # see get_lyrics_lrc's comment
         headers={"X-Lyrics-SHA256": lyrics.sha256_text(row["plain"])},
     )
 
