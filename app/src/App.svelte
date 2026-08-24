@@ -895,6 +895,11 @@
       })),
       downloaded_at: stamp,
       verified_at: stamp, // it was hashed on the way in
+      // This rebuild is job-scoped (audio/art only, see roleOf) and would
+      // otherwise silently drop a lyrics fetch that predates it — lyrics.lrc
+      // itself survives a re-download fine (opfs-worker.js's sweep excludes
+      // it), but this row is the only record of that on the IndexedDB side.
+      lyrics: media[data.itemId]?.lyrics,
     };
     await db.put('local_media', row);
     media[data.itemId] = row;
