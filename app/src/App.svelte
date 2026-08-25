@@ -37,6 +37,9 @@
   let playlistImport = $state(null);
 
   let view = $state('library'); // 'library' | 'playlists'
+  let librarySearch = $state(''); // filters the library list by title/uploader
+  let libraryPageSize = $state(25); // number | 'all' — persisted, see boot below
+  let libraryPage = $state(1); // 1-indexed; reset whenever search or page size changes
   let playlists = $state([]); // catalogue mirror, from IndexedDB
   let playlistItems = $state([]); // raw playlist_items rows (incl. tombstones)
   let openPlaylistId = $state(null); // which playlist's detail view is open
@@ -158,6 +161,35 @@
   const playing = $derived(items.find((i) => i.id === playingId) ?? null);
   // "downloaded" means the bytes are here, not that a row once claimed they were.
   const downloaded = $derived(items.filter((i) => media[i.id]?.state === 'present'));
+
+  // Library search + pagination. Everything in `items` is already resident in
+  // memory (there's no server-side pagination — see D-3 in 08-decisions.md,
+  // this app's whole design assumes a personal-scale library), so both of
+  // these are plain array ops, not a fetch.
+  const librarySearchResults = $derived.by(() => {
+    const q = librarySearch.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(
+      (i) => i.title?.toLowerCase().includes(q) || i.uploader?.toLowerCase().includes(q),
+    );
+  });
+  const libraryTotalPages = $derived(
+    libraryPageSize === 'all' ? 1 : Math.max(1, Math.ceil(librarySearchResults.length / libraryPageSize)),
+  );
+  const pagedItems = $derived(
+    libraryPageSize === 'all'
+      ? librarySearchResults
+      : librarySearchResults.slice(
+          (libraryPage - 1) * libraryPageSize,
+          libraryPage * libraryPageSize,
+        ),
+  );
+  // A shorter search result, or a smaller page size, can strand the current
+  // page past the new last page — pull it back in range rather than showing
+  // an empty list with working pagination controls above it.
+  $effect(() => {
+    if (libraryPage > libraryTotalPages) libraryPage = libraryTotalPages;
+  });
   const verified = $derived(downloaded.filter((i) => media[i.id]?.verified_at).length);
   // One glance at the account avatar badge: persisted, shell cached, nothing
   // known-missing. A rollup for the badge only — the account sheet's own
@@ -237,6 +269,7 @@
     shellCached = !!navigator.serviceWorker?.controller;
     db.getMeta('last_sync').then((v) => (lastSync = v));
     db.getMeta('last_verify').then((v) => (lastVerify = v));
+    db.getMeta('library_page_size').then((v) => { if (v) libraryPageSize = v; });
     refreshStorage();
 
     // Object URLs are built for every downloaded item up front, not on click.
@@ -310,6 +343,12 @@
     items = catalogue.sort((a, b) => b.added_at.localeCompare(a.added_at));
     playlists = pls;
     playlistItems = plItems;
+  }
+
+  function setLibraryPageSize(size) {
+    libraryPage = 1;
+    libraryPageSize = size;
+    db.setMeta('library_page_size', size);
   }
 
   // The one place both halves of reconnect run together: push this device's
@@ -1348,8 +1387,39 @@
       {/if}
 
       {#if view === 'library'}
+        {#if items.length > 0}
+          <div class="library-controls">
+            <span class="url-input-wrap search-wrap">
+              <Icon name="search" size={18} />
+              <input
+                type="search"
+                placeholder="Search title or artist"
+                value={librarySearch}
+                oninput={(e) => {
+                  librarySearch = e.target.value;
+                  libraryPage = 1;
+                }}
+                aria-label="Search library"
+              />
+            </span>
+            <div class="chip-group">
+              <span class="chip-label dim">Show</span>
+              {#each [10, 25, 50, 100, 'all'] as size (size)}
+                <button
+                  type="button"
+                  class="chip"
+                  class:selected={libraryPageSize === size}
+                  onclick={() => setLibraryPageSize(size)}
+                >
+                  {size === 'all' ? 'All' : size}
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
         <ul class="track-list">
-          {#each items as item (item.id)}
+          {#each pagedItems as item (item.id)}
             {@const job = jobs[item.id]}
             {@const pct = progress[item.id]}
             <li class="track" class:active={playingId === item.id}>
@@ -1441,11 +1511,31 @@
             </li>
           {:else}
             <li class="empty-state">
-              <p>Nothing downloaded yet.</p>
-              <p class="dim">Tap the + below to add a track from YouTube or SoundCloud.</p>
+              {#if items.length === 0}
+                <p>Nothing downloaded yet.</p>
+                <p class="dim">Tap the + below to add a track from YouTube or SoundCloud.</p>
+              {:else}
+                <p>No matches for "{librarySearch}".</p>
+              {/if}
             </li>
           {/each}
         </ul>
+
+        {#if libraryPageSize !== 'all' && libraryTotalPages > 1}
+          <div class="pagination">
+            <button class="btn ghost" onclick={() => libraryPage--} disabled={libraryPage <= 1}>
+              Prev
+            </button>
+            <span class="dim">Page {libraryPage} of {libraryTotalPages}</span>
+            <button
+              class="btn ghost"
+              onclick={() => libraryPage++}
+              disabled={libraryPage >= libraryTotalPages}
+            >
+              Next
+            </button>
+          </div>
+        {/if}
       {:else if !openPlaylist}
         <form
           class="url-form compact"
@@ -2378,6 +2468,27 @@
   .chip-check input {
     width: 20px;
     height: 20px;
+  }
+
+  .library-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .search-wrap {
+    color: var(--text-dim);
+  }
+  .search-wrap input {
+    font-size: 15px;
+  }
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    margin: 16px 0;
+    font-size: 13px;
   }
 
   /* ---- track / playlist lists ------------------------------------------ */

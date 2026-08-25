@@ -77,6 +77,12 @@
       ],
     },
     refresh: { shapes: [{ d: 'M4.5 12a7.5 7.5 0 0112.8-5.3M19.5 12a7.5 7.5 0 01-12.8 5.3M17.3 4.5v4.2h-4.2M6.7 19.5v-4.2h4.2' }] },
+    search: {
+      shapes: [
+        { tag: 'circle', cx: 10.5, cy: 10.5, r: 6.5 },
+        { d: 'M20 20l-5-5' },
+      ],
+    },
     link: {
       shapes: [
         { tag: 'rect', x: 2.5, y: 9.2, width: 9, height: 5.6, rx: 2.8, transform: 'rotate(-45 7 12)' },
