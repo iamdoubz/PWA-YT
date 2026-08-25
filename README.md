@@ -1,5 +1,9 @@
 # PWA-YT
 
+[![CI](https://github.com/iamdoubz/PWA-YT/actions/workflows/ci.yml/badge.svg)](https://github.com/iamdoubz/PWA-YT/actions/workflows/ci.yml)
+[![Docker](https://github.com/iamdoubz/PWA-YT/actions/workflows/docker.yml/badge.svg)](https://github.com/iamdoubz/PWA-YT/actions/workflows/docker.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An offline-first progressive web app that downloads audio and video from YouTube
 and SoundCloud, stores it **on your device**, and plays it back with no network
 connection at all.
@@ -98,6 +102,8 @@ follow the offline test protocol in [`docs/02-offline-playback.md`](docs/02-offl
 - **Full documentation index:** [`docs/00-HANDOFF.md`](docs/00-HANDOFF.md)
 - **Current build status, what's verified, what's next:** [`docs/09-status.md`](docs/09-status.md)
 - **Architecture, stack, data model:** [`docs/01-architecture.md`](docs/01-architecture.md)
+- **Prebuilt images:** [`pwa-yt-server`](https://github.com/iamdoubz/PWA-YT/pkgs/container/pwa-yt-server) · [`pwa-yt-app`](https://github.com/iamdoubz/PWA-YT/pkgs/container/pwa-yt-app) on GHCR
+- **Issues / bugs:** [github.com/iamdoubz/PWA-YT/issues](https://github.com/iamdoubz/PWA-YT/issues)
 
 ## Personal use
 
