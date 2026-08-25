@@ -568,7 +568,7 @@ _enable_docs = os.environ.get("PWA_YT_ENABLE_DOCS", "").lower() in ("1", "true",
 
 app = FastAPI(
     title="PWA-YT",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
     docs_url="/docs" if _enable_docs else None,
     redoc_url="/redoc" if _enable_docs else None,
