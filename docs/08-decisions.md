@@ -1024,3 +1024,67 @@ real chunk of extra layout work for an edge case that only affects
 light-mode users on notched iOS devices, and dark remains this app's
 proven, default, real-device-tested configuration. Revisit if light mode
 turns out to be a commonly chosen mode on iOS home-screen installs.
+
+## D-030 · Two more sources shipped (Bandcamp, Mixcloud); Vimeo shipped cookie-gated; Audiomack held back
+
+**Status:** accepted · 2026-08-25
+
+**Decision.** `extract.ALLOWED_EXTRACTORS` (D-022) grows from
+`["youtube.*", "soundcloud.*"]` to also include `"bandcamp.*"`,
+`"mixcloud.*"`, and `"vimeo.*"` — the exact mechanism D-022 already
+prescribed for a third source. `pipeline.py` imports the same constant, so
+this is the entire server-side change; nothing about the pipeline is
+YouTube/SoundCloud-specific. Four sites were requested; only three shipped,
+because this app's whole reason for existing (D-001, D-003) is that offline
+playback *actually works*, and two of the four failed live verification
+against the real running extractor, not just docs:
+
+- **Bandcamp, Mixcloud** — resolved live with no auth, exactly as expected.
+  Fully wired: allowlist, canary, UI copy.
+- **Vimeo** — Vimeo revoked yt-dlp's anonymous OAuth token in July 2026
+  (upstream: [yt-dlp#17271](https://github.com/yt-dlp/yt-dlp/issues/17271),
+  still open); every plain `vimeo.com/<id>` URL now fails
+  `"the web client only works when logged-in"` regardless of the video's
+  own privacy setting. Shipped anyway, gated on the per-user cookie jar
+  (D-020) this app already has for private/age-gated content — the same
+  mechanism, one more reason to use it. The Account sheet's cookie helper
+  text now says so. `/health/extractors`'s `vimeo` canary has no user to
+  borrow cookies from, so it is *expected* to read red; that entry exists
+  to surface a second, different failure mode in the same place, not
+  because it's expected to pass.
+- **Audiomack** — every URL 404s on yt-dlp's metadata call, a currently
+  unresolved upstream bug
+  ([yt-dlp#14815](https://github.com/yt-dlp/yt-dlp/issues/14815), open
+  since October 2025). Unlike Vimeo this isn't an auth problem cookies
+  would fix — the extractor itself is broken — so nothing here would make
+  it work. Not added to `ALLOWED_EXTRACTORS`, the canary table, or any UI
+  copy: shipping a "supported" source that fails 100% of the time is worse
+  than not listing it.
+
+**Verified case-insensitive full match**, not just eyeballed — each shipped
+site's real `extractor_key` values (including the sub-extractors
+playlists/albums/users resolve through: `Bandcamp:album`,
+`mixcloud:playlist`, `vimeo:user`, etc.) were pulled from the installed
+yt-dlp package (`yt_dlp.extractor.gen_extractors()`) and checked against
+the new patterns with the identical `re.fullmatch(pattern, key,
+re.IGNORECASE)` yt-dlp uses internally — pinned in
+`test_allowed_extractors_cover_the_supported_platform_names`.
+
+**Canaries.** `/health/extractors` gets one entry per shipped source.
+Rather than pick an arbitrary public track that could vanish and read as a
+false extractor failure — the exact failure mode the canary comment already
+warns about — Bandcamp's and Mixcloud's canary URLs are the fixtures
+yt-dlp's own extractor test suite uses
+(`youtube-dl.bandcamp.com/track/youtube-dl-test-song`,
+`mixcloud.com/dholbach/cryptkeeper`), pulled from
+`yt_dlp/extractor/{bandcamp,mixcloud}.py` on 2026-08-25 and confirmed live.
+Vimeo's canary (`vimeo.com/56015672`, the same suite's fixture) is kept
+despite the expected-red state above, both for the second-failure-mode
+reason and because it flips to a real pass/fail signal the moment Vimeo
+restores anonymous access.
+
+**What would change this.** Audiomack: revisit once yt-dlp#14815 closes —
+same one-line addition D-022 always described. Vimeo: if
+yt-dlp/Vimeo restore anonymous access, the canary starts passing on its own
+and the cookie requirement can be dropped from the UI copy; nothing else
+would need to change.

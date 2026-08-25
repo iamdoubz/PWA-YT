@@ -1513,7 +1513,7 @@
             <li class="empty-state">
               {#if items.length === 0}
                 <p>Nothing downloaded yet.</p>
-                <p class="dim">Tap the + below to add a track from YouTube or SoundCloud.</p>
+                <p class="dim">Tap the + below to add a track from YouTube, SoundCloud, Bandcamp, Mixcloud, or Vimeo.</p>
               {:else}
                 <p>No matches for "{librarySearch}".</p>
               {/if}
@@ -1732,7 +1732,7 @@
         >
           <span class="url-input-wrap">
             <Icon name="link" size={18} />
-            <input type="url" bind:value={urlInput} placeholder="Paste a YouTube or SoundCloud link" aria-label="Media URL" />
+            <input type="url" bind:value={urlInput} placeholder="Paste a YouTube, SoundCloud, Bandcamp, Mixcloud, or Vimeo link" aria-label="Media URL" />
           </span>
           <button type="submit" class="btn accent" disabled={resolving || !urlInput.trim()}>
             {resolving ? 'Looking…' : 'Look up'}
@@ -1873,7 +1873,7 @@
 
         <h3 class="section-title">Cookies</h3>
         <p class="dim tiny">
-          For private or age-restricted content
+          For private or age-restricted content, and required for every Vimeo link right now
           {#if cookiesInfo?.configured}
             — configured {when(cookiesInfo.updated_at)}
           {:else if cookiesInfo}

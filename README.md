@@ -4,9 +4,9 @@
 [![Docker](https://github.com/iamdoubz/PWA-YT/actions/workflows/docker.yml/badge.svg)](https://github.com/iamdoubz/PWA-YT/actions/workflows/docker.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-An offline-first progressive web app that downloads audio and video from YouTube
-and SoundCloud, stores it **on your device**, and plays it back with no network
-connection at all.
+An offline-first progressive web app that downloads audio and video from YouTube,
+SoundCloud, Bandcamp, Mixcloud, and Vimeo, stores it **on your device**, and
+plays it back with no network connection at all.
 
 > **Offline playback is not a feature of this app. It is the app.**
 
@@ -90,7 +90,7 @@ follow the offline test protocol in [`docs/02-offline-playback.md`](docs/02-offl
 ## What it does
 
 - Log in with a passkey (invite-only, multi-user)
-- Paste a YouTube or SoundCloud link, or a whole playlist
+- Paste a link from YouTube, SoundCloud, Bandcamp, Mixcloud, or Vimeo (Vimeo needs cookies saved first — see Account) — a single track or a whole playlist
 - Preview what a playlist contains and how much space it needs **before** committing
 - Download as **AAC** (default) or **MP3**, with optional video and optional artwork
 - Media persists in device storage — OPFS, not a server

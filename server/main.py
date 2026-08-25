@@ -54,6 +54,22 @@ CANARY_URLS = {
     "soundcloud": os.environ.get(
         "PWA_YT_CANARY_SOUNDCLOUD", "https://soundcloud.com/bawwww/2-0-2x-1"
     ),
+    # yt-dlp's own extractor test fixtures — maintained by yt-dlp upstream
+    # specifically so they don't disappear, which is exactly what a canary
+    # needs.
+    "bandcamp": os.environ.get(
+        "PWA_YT_CANARY_BANDCAMP",
+        "http://youtube-dl.bandcamp.com/track/youtube-dl-test-song",
+    ),
+    "mixcloud": os.environ.get(
+        "PWA_YT_CANARY_MIXCLOUD", "http://www.mixcloud.com/dholbach/cryptkeeper/"
+    ),
+    # Expected red: Vimeo revoked anonymous access in July 2026 (D-030) and
+    # this canary has no user to borrow cookies from — a per-user cookie
+    # jar doesn't map onto a global health check. This entry exists so a
+    # *second*, different Vimeo failure mode is still visible in the same
+    # place, not because it's expected to pass today.
+    "vimeo": os.environ.get("PWA_YT_CANARY_VIMEO", "https://vimeo.com/56015672"),
 }
 
 _canary: dict[str, dict] = {}

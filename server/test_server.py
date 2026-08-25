@@ -122,7 +122,29 @@ def test_ssrf_extractor_allowlist_blocks_out_of_scope_urls():
     except extract.ResolveError as err:
         assert "no suitable extractor" in str(err).lower(), err
     else:
-        raise AssertionError("a URL outside youtube/soundcloud must be rejected, not fetched")
+        raise AssertionError("a URL outside the allowed extractor families must be rejected, not fetched")
+
+
+def test_allowed_extractors_cover_the_supported_platform_names():
+    """D-030: adding a platform means adding its extractor_key pattern here —
+    this pins that each supported site's real yt-dlp extractor_key (including
+    the sub-extractors used for playlists/albums/users) actually matches one
+    of the configured patterns, the same case-insensitive full match yt-dlp
+    itself applies (D-022)."""
+    import re
+
+    extractor_keys = [
+        "Youtube", "youtube:playlist", "youtube:tab",
+        "SoundCloud", "soundcloud:set", "soundcloud:user",
+        "Bandcamp", "Bandcamp:album", "Bandcamp:user", "Bandcamp:weekly",
+        "mixcloud", "mixcloud:playlist", "mixcloud:user",
+        "vimeo", "vimeo:album", "vimeo:channel", "vimeo:user",
+    ]
+    for key in extractor_keys:
+        assert any(
+            re.fullmatch(pattern, key, re.IGNORECASE)
+            for pattern in extract.ALLOWED_EXTRACTORS
+        ), f"{key} matches none of {extract.ALLOWED_EXTRACTORS}"
 
 
 def test_api_docs_are_disabled_by_default():
