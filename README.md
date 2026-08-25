@@ -8,87 +8,78 @@ connection at all.
 
 Add a link or a playlist while online. A server fetches and transcodes the media,
 hands it to the browser once, and forgets it. From that moment the media belongs
-to the device. On a plane, in a tunnel, in airplane mode with wifi and bluetooth
-off — the app opens and plays.
+to the device — on a plane, in a tunnel, in airplane mode, the app opens and
+plays.
 
 ---
 
-## Status
+## Install
 
-**v0.0–v0.2 built. Not yet verified on a physical device.**
-
-The pipeline runs end to end for YouTube and SoundCloud: paste a link, see what
-it is and what it will cost, download it, and play it back with both the API and
-the web server switched off. Verified on desktop Chrome.
-
-The device test protocol in `docs/02-offline-playback.md` — the one that actually
-decides whether this works — has **not** been run, and the seven-day soak has not
-been started. v0.1's acceptance criteria are all device criteria and all remain
-open.
-
-**Resuming? Read [`docs/09-status.md`](docs/09-status.md) first** — built vs not
-built, known traps, and where to pick up. Then `docs/00-HANDOFF.md` and
-`CLAUDE.md`.
-
-## Running it
-
-Two processes. The app proxies `/api` to the server, so everything is one origin
-— no CORS, and a tunnel in front of it works without configuration.
-
-```bash
-# terminal 1 — the stateless transformer
-cd server && uv run uvicorn main:app --port 8000
-
-# terminal 2 — the app
-cd app && npm install && npm run build && npm run preview -- --port 4173
-```
-
-Then open <http://localhost:4173>. Requires `ffmpeg` on `PATH`.
-
-```bash
-cd server && uv run python test_server.py   # server self-check
-cd app && npm run check:no-cdn              # fails if the shell gained a CDN reference
-```
-
-### Docker
-
-Two containers, one volume (`docs/01-architecture.md`), `linux/amd64` only.
+### Docker Compose (recommended)
 
 ```bash
 cp .env.example .env   # then edit it
 docker compose up -d --build
 ```
 
-The app container serves the built PWA on `$APP_PORT` (default `8080`) and
-proxies `/api` to the server container, same as the Vite dev proxy — one
-origin, no CORS. Images also publish to `ghcr.io/<owner>/pwa-yt-{server,app}`
-via `.github/workflows/docker.yml` on every push to `main` and on version tags.
+Open <http://localhost:8080> (the port `.env`'s `APP_PORT` sets).
 
-### Inviting a user
-
-Registration is invite-only by design (`docs/08-decisions.md` D-008) — there
-is deliberately no signup endpoint. Minting a code is an operator action:
+### Docker, without Compose
 
 ```bash
-# Docker
-docker compose exec server uv run python scripts/create_invite.py
+docker network create pwa-yt
+docker volume create pwa-yt-db
 
-# bare processes
-cd server && uv run python scripts/create_invite.py
+docker build -t pwa-yt-server ./server
+docker build -t pwa-yt-app ./app
+
+docker run -d --name server --network pwa-yt --restart unless-stopped \
+  -e PWA_YT_RP_ID=localhost \
+  -v pwa-yt-db:/data \
+  --tmpfs /app/scratch \
+  pwa-yt-server
+
+docker run -d --name app --network pwa-yt --restart unless-stopped \
+  -p 8080:80 \
+  pwa-yt-app
 ```
 
-Prints a short one-time code. In the app, click **"Have an invite code?
-Register"**, enter it plus an email and display name, then create the account
-with a passkey — `PWA_YT_RP_ID`/`PWA_YT_ORIGINS` must already match the
-hostname you're registering from (see `.env.example`) or the passkey ceremony
-fails. Every login after that is just "Sign in with a passkey," no code
-needed. Passing an existing user's id as an argument attributes the invite to
-them instead of leaving it anonymous — see the script's docstring.
+Open <http://localhost:8080>. The app container's nginx expects the server
+container to be reachable as `server` — keep that container name if you change
+anything else.
 
-To test it the way it is meant to be used, put it on a phone over real HTTPS
-(`cloudflared tunnel --url http://localhost:4173`), add it to the home screen,
-then follow the protocol in `docs/02-offline-playback.md`. A localhost check with
-DevTools set to offline lies about iOS.
+### Manual
+
+Two processes. Requires `ffmpeg` on `PATH`.
+
+```bash
+# terminal 1 — the server
+cd server && uv run uvicorn main:app --port 8000
+
+# terminal 2 — the app
+cd app && npm install && npm run build && npm run preview -- --port 4173
+```
+
+Open <http://localhost:4173> — use `localhost`, not `127.0.0.1`; WebAuthn
+(passkeys) rejects an IP address as a valid domain.
+
+### First login
+
+Registration is invite-only — there's no signup endpoint. Mint a code:
+
+```bash
+docker compose exec server uv run python scripts/create_invite.py   # Compose
+docker exec server uv run python scripts/create_invite.py           # plain Docker
+cd server && uv run python scripts/create_invite.py                 # manual
+```
+
+In the app, **"Have an invite code? Register"**, enter it plus an email and
+display name, then create the account with a passkey. Every login after that
+is just "Sign in with a passkey."
+
+To use it the way it's meant to be used, put it on a phone over real HTTPS
+(a `cloudflared` tunnel, or any reverse proxy), add it to the home screen, and
+follow the offline test protocol in [`docs/02-offline-playback.md`](docs/02-offline-playback.md).
 
 ---
 
@@ -102,56 +93,11 @@ DevTools set to offline lies about iOS.
 - Build playlists from downloaded content, entirely offline
 - Remove content and free space, with one-tap re-download
 
-## How it is built
+## More
 
-```
-DEVICE                                  SERVER
-  IndexedDB   catalogue, playlists        FastAPI + SQLite (metadata only)
-  OPFS        the media itself            yt-dlp → ffmpeg → signed artifact
-  Web Worker  streaming writes            tmpfs scratch, deleted on collection
-```
-
-The server is a **stateless transformer**, never a media library. Media transits
-it and is never retained. The client is the only durable holder — and every item
-stays re-derivable from its source URL and format profile, so storage eviction is
-an inconvenience rather than data loss.
-
-## Documentation
-
-| Document | What it covers |
-|---|---|
-| [`docs/00-HANDOFF.md`](docs/00-HANDOFF.md) | **Start here.** The brief, the thesis, the non-negotiables |
-| [`docs/01-architecture.md`](docs/01-architecture.md) | Components, pipeline, deployment, concurrency |
-| [`docs/02-offline-playback.md`](docs/02-offline-playback.md) | **Normative spec.** Failure modes and the device test protocol |
-| [`docs/03-data-model.md`](docs/03-data-model.md) | SQLite DDL, IndexedDB stores, sync protocol |
-| [`docs/04-api.md`](docs/04-api.md) | Endpoint contracts |
-| [`docs/05-formats.md`](docs/05-formats.md) | Format profiles and exact ffmpeg invocations |
-| [`docs/06-build-plan.md`](docs/06-build-plan.md) | Phases with acceptance criteria |
-| [`docs/07-risks.md`](docs/07-risks.md) | What will bite you |
-| [`docs/08-decisions.md`](docs/08-decisions.md) | Why things are the way they are |
-| [`docs/09-status.md`](docs/09-status.md) | **Built vs not built.** Start here when resuming |
-
-## Stack
-
-| Layer | Choice |
-|---|---|
-| Frontend | Svelte 5 · Vite · `vite-plugin-pwa` |
-| Client storage | OPFS (media) · IndexedDB (catalogue) |
-| Backend | Python 3.11+ · FastAPI · `uv` |
-| Database | SQLite (WAL) — no Postgres, no Redis |
-| Media | yt-dlp as a library · ffmpeg · `bgutil-ytdlp-pot-provider` |
-| Auth | WebAuthn passkeys, magic-link fallback |
-
-## Next task
-
-Put v0.1 on a physical iPhone and run the offline test protocol. Everything in
-v0.2 onward assumes a yes to the one question that invalidates the design if the
-answer is bad:
-
-> *Does a downloaded file survive on a real iPhone home-screen PWA, and play in
-> airplane mode, a week later, with the device low on free space?*
-
-Assertion 15 — the seven-day soak — is a wall clock. Start it early.
+- **Full documentation index:** [`docs/00-HANDOFF.md`](docs/00-HANDOFF.md)
+- **Current build status, what's verified, what's next:** [`docs/09-status.md`](docs/09-status.md)
+- **Architecture, stack, data model:** [`docs/01-architecture.md`](docs/01-architecture.md)
 
 ## Personal use
 
