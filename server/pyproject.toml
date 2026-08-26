@@ -1,6 +1,6 @@
 [project]
 name = "pwa-yt-server"
-version = "0.9.0"
+version = "0.9.1"
 description = "Stateless transformer. Holds metadata, never media."
 requires-python = ">=3.11"
 dependencies = [
