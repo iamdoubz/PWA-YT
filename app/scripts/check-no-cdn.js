@@ -25,6 +25,22 @@ const ALLOW = [
   /^https:\/\/github\.com\/iamdoubz\/PWA-YT$/,
 ];
 
+// Open Graph / Twitter tags carry an absolute URL on purpose once
+// PUBLIC_ORIGIN is set (see vite.config.js) — Facebook and X reject
+// relative ones. They are metadata read by link-preview scrapers: never
+// fetched by the browser, never on the boot or playback path, and absent
+// entirely from the precache. The exemption is deliberately narrow — only the
+// content= of an og:*/twitter:* <meta> — so an absolute <link href> or
+// <script src> in the very same file is still a finding.
+const previewUrls = (html) =>
+  new Set(
+    [
+      ...html.matchAll(
+        /<meta\s+(?:property|name)="(?:og|twitter):[\w:]+"\s+content="(https?:\/\/[^"]+)"/g,
+      ),
+    ].map((m) => m[1]),
+  );
+
 const walk = (dir) =>
   readdirSync(dir).flatMap((name) => {
     const path = join(dir, name);
@@ -35,8 +51,9 @@ let findings = 0;
 for (const file of walk(dist)) {
   if (!/\.(js|css|html|webmanifest|json)$/.test(file)) continue;
   const text = readFileSync(file, 'utf8');
+  const exempt = file.endsWith('.html') ? previewUrls(text) : new Set();
   for (const [url] of text.matchAll(/https?:\/\/[^\s"'`)\\]+/g)) {
-    if (ALLOW.some((re) => re.test(url))) continue;
+    if (ALLOW.some((re) => re.test(url)) || exempt.has(url)) continue;
     console.error(`${file.slice(dist.length + 1)}: ${url}`);
     findings += 1;
   }

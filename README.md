@@ -23,10 +23,17 @@ plays.
 
 ```bash
 cp .env.example .env   # then edit it
-docker compose up -d --build
+docker compose up -d            # pulls the prebuilt images from GHCR
+docker compose up -d --build    # or build both from source instead
 ```
 
 Open <http://localhost:8080> (the port `.env`'s `APP_PORT` sets).
+
+`PWA_YT_TAG` picks the image tag (`latest`, or pin a release like `0.9.0`).
+`PUBLIC_ORIGIN` is applied when the app container starts, so setting it works
+on a pulled image and needs no rebuild — change it and `docker compose up -d`.
+Leave it blank and link-preview URLs stay relative, which every chat app
+except Facebook and X resolves correctly on its own.
 
 ### Docker, without Compose
 
@@ -45,8 +52,13 @@ docker run -d --name server --network pwa-yt --restart unless-stopped \
 
 docker run -d --name app --network pwa-yt --restart unless-stopped \
   -p 8080:80 \
+  -e PUBLIC_ORIGIN= \
   pwa-yt-app
 ```
+
+Swap the two `docker build` lines for `docker pull ghcr.io/iamdoubz/pwa-yt-server`
+and `…/pwa-yt-app` to use the prebuilt images. Set `PUBLIC_ORIGIN` to the URL
+this is reached at (no trailing slash) if you want absolute link-preview URLs.
 
 Open <http://localhost:8080>. The app container's nginx expects the server
 container to be reachable as `server` — keep that container name if you change
@@ -90,7 +102,7 @@ follow the offline test protocol in [`docs/02-offline-playback.md`](docs/02-offl
 ## What it does
 
 - Log in with a passkey (invite-only, multi-user)
-- Paste a link from YouTube, SoundCloud, Bandcamp, Mixcloud, or Vimeo (Vimeo needs cookies saved first — see Account) — a single track or a whole playlist
+- Paste a link from YouTube, SoundCloud, Bandcamp, Mixcloud, or Vimeo (Vimeo needs cookies saved first — see Account → Connections) — a single track or a whole playlist
 - Preview what a playlist contains and how much space it needs **before** committing
 - Download as **AAC** (default) or **MP3**, with optional video and optional artwork
 - Media persists in device storage — OPFS, not a server
