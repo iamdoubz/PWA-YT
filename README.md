@@ -29,7 +29,9 @@ docker compose up -d --build    # or build both from source instead
 
 Open <http://localhost:8080> (the port `.env`'s `APP_PORT` sets).
 
-`PWA_YT_TAG` picks the image tag (`latest`, or pin a release like `0.9.0`).
+`PWA_YT_TAG` picks the image tag: `latest` (most recent release), `0.9.0` (that
+release, pinned), `0.9` (newest patch of that minor), or `dev` (rebuilt on every
+push to `main` — unreleased, expect breakage).
 `PUBLIC_ORIGIN` is applied when the app container starts, so setting it works
 on a pulled image and needs no rebuild — change it and `docker compose up -d`.
 Leave it blank and link-preview URLs stay relative, which every chat app
