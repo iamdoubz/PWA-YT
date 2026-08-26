@@ -2,6 +2,10 @@ node_modules/
 dist/
 dev-dist/
 
+# Real secrets live here (PWA_YT_COOKIE_KEY, SMTP password). .env.example is
+# the tracked template; .env itself must never be committed.
+.env
+
 # Generated test fixtures — regenerate with `npm run fixtures`.
 # 86 MB of sine wave does not belong in git.
 app/public/media/
