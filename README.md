@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/public/imgs/opengraph.png" alt="Opengraph image for PWA-YT featuring the letters P.W.A. and the yt-dlp logo perched underneath them">
+</p>
+
 # PWA-YT
 
 [![CI](https://github.com/iamdoubz/PWA-YT/actions/workflows/ci.yml/badge.svg)](https://github.com/iamdoubz/PWA-YT/actions/workflows/ci.yml)
