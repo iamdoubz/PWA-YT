@@ -1,14 +1,27 @@
 name: Docker
 
 # amd64 only, by design (CLAUDE.md / this repo targets a single small VM, not
-# a fleet). Builds on every push/PR to catch a broken Dockerfile; only pushes
-# to GHCR from main or a version tag.
+# a fleet).
+#
+# What gets published, and when:
+#
+#   push to main       ->  :dev, :sha-<short>      the moving edge
+#   release published  ->  :X.Y.Z, :X.Y, :latest   what a deployment pins to
+#   pull request       ->  built, never pushed     catches a broken Dockerfile
+#
+# Tag pushes are deliberately NOT a trigger any more. Publishing a release
+# through the GitHub UI creates the tag as well, so listening for both would
+# start two concurrent runs racing to move :latest onto the same digest.
+# Pushing a bare tag now builds nothing — cut a release instead.
 on:
   push:
     branches: [main]
-    tags: ["v*.*.*"]
+  release:
+    types: [published]
   pull_request:
     branches: [main]
+  # Manual re-run, e.g. to republish :dev without an empty commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,12 +49,26 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/pwa-yt-${{ matrix.image }}
+          # Every line below is input to the action, not YAML — no comments
+          # inside this block, they would be parsed as tag patterns.
+          #
+          # `enable` is spelled out per tag rather than left to the ref shape:
+          # a bare `latest` would otherwise ride along on every main push and
+          # quietly make the edge the default that anyone pulling gets.
+          #
+          # On `latest`, the event_name check has to come first: off a
+          # non-release event `github.event.release` is null, and a bare
+          # negation of null reads as true, which would put `latest` on main.
+          #
+          # The trailing `type=ref,event=pr` only names the PR build locally;
+          # `push:` below is false for pull requests, so it is never published.
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+            type=sha,enable=${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
+            type=ref,event=pr
 
       - uses: docker/build-push-action@v6
         with:
