@@ -38,9 +38,23 @@ CREATE TABLE users (
   daily_byte_budget   INTEGER NOT NULL DEFAULT 5368709120,   -- 5 GiB
   max_concurrent      INTEGER NOT NULL DEFAULT 2,
   created_at          TEXT NOT NULL,
-  disabled_at         TEXT,
-  cookies_encrypted   BLOB,                          -- Fernet; write-only, see 04-api.md
-  cookies_updated_at  TEXT
+  disabled_at         TEXT
+  -- cookies_encrypted/cookies_updated_at lived here until D-031, one jar per
+  -- user. They are now user_cookies, one jar per integration; the columns are
+  -- dropped at startup by main._migrate_legacy_cookie_jar.
+);
+
+-- One cookie jar per user per integration (D-031). `source` is a key of
+-- extract.SOURCES. What is stored has already been filtered down to that
+-- source's own domains at save time, so a YouTube job cannot be handed the
+-- user's SoundCloud session — or their bank's.
+CREATE TABLE user_cookies (
+  user_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source            TEXT NOT NULL,                   -- 'youtube' | 'soundcloud' | ...
+  cookies_encrypted BLOB NOT NULL,                   -- Fernet; write-only, see 04-api.md
+  updated_at        TEXT NOT NULL,
+  expires_at        TEXT,                            -- soonest stored expiry; NULL = all session cookies
+  PRIMARY KEY (user_id, source)
 );
 
 CREATE TABLE credentials (                          -- WebAuthn passkeys

@@ -12,6 +12,7 @@
   import * as sync from './sync.js';
   import { uuid7 } from './id.js';
   import Icon from './Icon.svelte';
+  import SourceIcon from './SourceIcon.svelte';
 
   const ACTIVE = ['queued', 'fetching', 'transforming', 'ready'];
   const STAGE = {
@@ -98,11 +99,88 @@
   // Account settings — loaded lazily after first paint, same as everything
   // else that needs a network round trip. FM-2.
   let usage = $state(null); // { bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs } | null
-  let cookiesInfo = $state(null); // { configured, updated_at } | null
   let health = $state(null); // { version, yt_dlp_version } | null — server /health, shown in the Account footer
+  // [{ source, label, cookies, configured, updated_at, expires_at }] | null.
+  // Every supported integration, configured or not — the server owns this list.
+  let connections = $state(null);
   let cookiesText = $state('');
   let cookiesBusy = $state(false);
   let cookiesMessage = $state(null);
+  let cookiesError = $state(null);
+
+  // The Account sheet is a small stack, not three sheets: 'root' → 'connections'
+  // → one source. A second sheet on top would leave Escape ambiguous and lose
+  // the way back to Account. Reset on close so reopening never lands deep.
+  let accountView = $state('root'); // 'root' | 'connections' | <source key>
+
+  const connection = $derived(
+    connections?.find((c) => c.source === accountView) ?? null,
+  );
+  const connectionsConfigured = $derived(
+    connections ? connections.filter((c) => c.configured).length : null,
+  );
+
+  // Per-source instructions. UI copy, so it lives here rather than on the
+  // server: it has to be readable from the precached shell, and it changes for
+  // reasons (a site redesigns its settings page) that have nothing to do with
+  // whether the extractor works.
+  const COOKIE_HELP = {
+    youtube: {
+      steps: [
+        'Open a private/incognito window and sign in to YouTube.',
+        'In that same window, go to youtube.com/robots.txt — not a video page.',
+        'Export with a cookies.txt browser extension, Netscape format, this site only.',
+        'Close the private window without signing out.',
+      ],
+      warn:
+        'Steps 2 and 4 are the ones people skip. YouTube rotates the session when you keep browsing, and signing out anywhere kills the exported cookies with it — that is why cookies "stop working" after an hour.',
+    },
+    soundcloud: {
+      steps: [
+        'Sign in to SoundCloud in your browser.',
+        'On a soundcloud.com tab, export cookies with a cookies.txt extension (Netscape format).',
+      ],
+      note: 'Only needed for private, unlisted, or Go+ tracks. Public tracks work without this.',
+    },
+    vimeo: {
+      steps: [
+        'Sign in to Vimeo in your browser.',
+        'On a vimeo.com tab, export cookies with a cookies.txt extension (Netscape format).',
+      ],
+      warn:
+        'Vimeo revoked anonymous access in July 2026, so every Vimeo link needs this — not just private ones.',
+    },
+    bandcamp: {
+      steps: [
+        'Sign in to Bandcamp in your browser.',
+        'On a bandcamp.com tab, export cookies with a cookies.txt extension (Netscape format).',
+      ],
+      note: 'Public Bandcamp streams work without signing in. Add cookies only for fan-only or subscriber streams your account can already play.',
+    },
+    mixcloud: {
+      steps: [
+        'Sign in to Mixcloud in your browser.',
+        'On a mixcloud.com tab, export cookies with a cookies.txt extension (Netscape format).',
+      ],
+      note: 'Public Mixcloud shows work without signing in. Add cookies only for subscriber-only shows your account can already play.',
+    },
+  };
+
+  // Status is never carried by the dot alone — the word next to it says the
+  // same thing (color-not-only).
+  function connStatus(c) {
+    if (!c.configured) {
+      if (c.cookies === 'required') return { tone: 'warn', text: 'Required' };
+      if (c.cookies === 'not_needed') return { tone: 'none', text: 'Not needed' };
+      return { tone: 'none', text: 'Optional' };
+    }
+    if (!c.expires_at) return { tone: 'good', text: 'Saved' };
+    const days = Math.floor((new Date(c.expires_at) - Date.now()) / 86400000);
+    if (days < 0) return { tone: 'bad', text: 'Expired' };
+    if (days === 0) return { tone: 'warn', text: 'Expires today' };
+    if (days <= 7) return { tone: 'warn', text: `Expires in ${days}d` };
+    return { tone: 'good', text: 'Saved' };
+  }
 
   // ---- UI-only state (this redesign pass). None of this touches the
   // sync/outbox/OPFS machinery — it only decides what's on screen. (Theme is
@@ -143,6 +221,9 @@
   const sheetExit = { y: 24, duration: prefersReducedMotion ? 0 : 160, easing: cubicIn };
   const backdropEnter = { duration: prefersReducedMotion ? 0 : 200 };
   const backdropExit = { duration: prefersReducedMotion ? 0 : 150 };
+  // Drilling in/out of the Account sheet's sub-views. Shorter than a sheet
+  // transition — this is a step inside a surface that is already open.
+  const viewEnter = { x: 20, duration: prefersReducedMotion ? 0 : 160, easing: cubicOut };
 
   function closeAddSheet() {
     sheet = null;
@@ -396,7 +477,7 @@
       /* shown as '…' below; not worth a banner over */
     }
     try {
-      cookiesInfo = await api.cookiesStatus();
+      connections = await api.cookiesStatus();
     } catch {
       /* same */
     }
@@ -407,30 +488,51 @@
     }
   }
 
-  async function saveCookies() {
+  function openConnection(source) {
+    accountView = source;
+    cookiesText = '';
+    cookiesError = null;
+    cookiesMessage = null;
+  }
+
+  function closeAccountSheet() {
+    sheet = null;
+    accountView = 'root';
+  }
+
+  // "Failed to fetch" is not a sentence anyone can act on. Everything else the
+  // server sends back already is one (wrong format, wrong site, too large).
+  const cookieErrorText = (err) =>
+    navigator.onLine === false
+      ? "You're offline — reconnect to update cookies."
+      : err.message;
+
+  async function saveCookies(source) {
     if (!cookiesText.trim()) return;
     cookiesBusy = true;
+    cookiesError = null;
     cookiesMessage = null;
     try {
-      await api.putCookies(cookiesText);
+      await api.putCookies(source, cookiesText);
       cookiesText = '';
-      cookiesInfo = await api.cookiesStatus();
+      connections = await api.cookiesStatus();
       cookiesMessage = 'Saved.';
     } catch (err) {
-      cookiesMessage = err.message;
+      cookiesError = cookieErrorText(err);
     } finally {
       cookiesBusy = false;
     }
   }
 
-  async function clearCookies() {
+  async function clearCookies(source) {
     cookiesBusy = true;
+    cookiesError = null;
     cookiesMessage = null;
     try {
-      await api.deleteCookies();
-      cookiesInfo = await api.cookiesStatus();
+      await api.deleteCookies(source);
+      connections = await api.cookiesStatus();
     } catch (err) {
-      cookiesMessage = err.message;
+      cookiesError = cookieErrorText(err);
     } finally {
       cookiesBusy = false;
     }
@@ -1291,7 +1393,11 @@
     if (e.key !== 'Escape') return;
     if (openMenuItemId) openMenuItemId = null;
     else if (playerExpanded) playerExpanded = false;
-    else if (sheet) sheet = null;
+    // Escape walks back up the Account sheet's stack before closing it, so
+    // it matches the back chevron rather than skipping past two levels.
+    else if (sheet === 'account' && accountView !== 'root')
+      accountView = accountView === 'connections' ? 'root' : 'connections';
+    else if (sheet) closeAccountSheet();
   }}
 />
 
@@ -1367,7 +1473,7 @@
       </span>
       <button
         class="avatar-btn"
-        onclick={() => (sheet = sheet === 'account' ? null : 'account')}
+        onclick={() => (sheet === 'account' ? closeAccountSheet() : ((accountView = 'root'), (sheet = 'account')))}
         aria-label={`Account. Offline readiness ${readinessOk ? 'ready' : 'needs attention'}.`}
       >
         <Icon name="account" size={20} />
@@ -1828,12 +1934,126 @@
   {/if}
 
   {#if sheet === 'account'}
-    <button class="sheet-backdrop" onclick={() => (sheet = null)} aria-label="Close" in:fade={backdropEnter} out:fade={backdropExit}></button>
+    <button class="sheet-backdrop" onclick={closeAccountSheet} aria-label="Close" in:fade={backdropEnter} out:fade={backdropExit}></button>
     <div class="sheet tall" role="dialog" aria-label="Account" in:fly={sheetEnter} out:fly={sheetExit}>
       <div class="sheet-handle-row">
-        <span class="sheet-kicker">Account</span>
-        <button class="icon-btn" onclick={() => (sheet = null)} aria-label="Close"><Icon name="close" /></button>
+        {#if accountView === 'root'}
+          <span class="sheet-kicker">Account</span>
+        {:else}
+          <button
+            class="icon-btn"
+            onclick={() => (accountView = accountView === 'connections' ? 'root' : 'connections')}
+            aria-label={accountView === 'connections' ? 'Back to Account' : 'Back to Connections'}
+          >
+            <Icon name="chevron-left" />
+          </button>
+          <span class="sheet-kicker">{connection ? connection.label : 'Connections'}</span>
+        {/if}
+        <button class="icon-btn" onclick={closeAccountSheet} aria-label="Close"><Icon name="close" /></button>
       </div>
+
+      {#if accountView === 'connections'}
+        <!-- Level 2: the picker. in: only, no out: — two sibling views both
+             animating would overlap and need absolute positioning to not
+             shove the sheet around mid-transition. -->
+        <div class="sheet-body" in:fly={viewEnter}>
+          <p class="dim tiny">
+            Some sites need your own login to reach private, age-restricted, or subscriber-only
+            tracks. Cookies are stored encrypted, are only ever sent to the site they came from,
+            and are never shown back once saved.
+          </p>
+          {#if connections}
+            <div class="conn-grid">
+              {#each connections as c (c.source)}
+                {@const status = connStatus(c)}
+                <button class="conn-tile" onclick={() => openConnection(c.source)}>
+                  <SourceIcon name={c.source} size={26} />
+                  <span class="conn-name">{c.label}</span>
+                  <span class="conn-status">
+                    <span class="dot {status.tone}"></span>
+                    <span class="dim tiny">{status.text}</span>
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="dim tiny">Loading…</p>
+          {/if}
+        </div>
+      {:else if connection}
+        <!-- Level 3: one integration. -->
+        {@const status = connStatus(connection)}
+        {@const help = COOKIE_HELP[connection.source]}
+        <div class="sheet-body" in:fly={viewEnter}>
+          <div class="conn-head">
+            <span class="conn-glyph"><SourceIcon name={connection.source} size={24} /></span>
+            <span class="meta">
+              <span class="conn-status">
+                <span class="dot {status.tone}"></span>
+                <strong>{status.text}</strong>
+              </span>
+              {#if connection.configured}
+                <span class="dim tiny">Saved {when(connection.updated_at)}</span>
+              {/if}
+            </span>
+            {#if connection.configured}
+              <button class="btn ghost" onclick={() => clearCookies(connection.source)} disabled={cookiesBusy}>
+                Clear
+              </button>
+            {/if}
+          </div>
+
+          {#if connection.cookies === 'not_needed' && !connection.configured}
+            <p class="dim tiny">{help.note}</p>
+          {/if}
+
+          <h3 class="section-title">How to get them</h3>
+          <ol class="steps">
+            {#each help.steps as step, i (i)}
+              <li>{step}</li>
+            {/each}
+          </ol>
+
+          {#if help.warn}
+            <p class="callout"><Icon name="alert-triangle" size={16} /><span>{help.warn}</span></p>
+          {:else if help.note && connection.cookies !== 'not_needed'}
+            <p class="dim tiny">{help.note}</p>
+          {/if}
+
+          <label class="field-label" for="cookie-paste">Paste the exported cookies.txt</label>
+          <!-- Single-line placeholder on purpose: a newline in a placeholder
+               does not reliably render as a break, and the two-line version
+               ran together into one unreadable line. -->
+
+          <textarea
+            id="cookie-paste"
+            rows="6"
+            class="mono"
+            spellcheck="false"
+            autocapitalize="off"
+            autocorrect="off"
+            autocomplete="off"
+            placeholder="# Netscape HTTP Cookie File …"
+            bind:value={cookiesText}
+          ></textarea>
+          <p class="dim tiny">
+            Only {connection.label} cookies are kept — everything else in the file is discarded
+            before it is saved.
+          </p>
+          {#if cookiesError}
+            <p class="row-err" role="alert">{cookiesError}</p>
+          {:else if cookiesMessage}
+            <p class="dim tiny" role="status">{cookiesMessage}</p>
+          {/if}
+          <button
+            class="btn accent wide"
+            onclick={() => saveCookies(connection.source)}
+            disabled={cookiesBusy || !cookiesText.trim()}
+          >
+            {cookiesBusy ? 'Saving…' : `Save ${connection.label} cookies`}
+          </button>
+        </div>
+      {:else}
       <div class="sheet-body">
         <div class="identity-row">
           <span class="avatar-lg"><Icon name="account" size={22} /></span>
@@ -1871,26 +2091,25 @@
           <p class="dim tiny">Loading…</p>
         {/if}
 
-        <h3 class="section-title">Cookies</h3>
-        <p class="dim tiny">
-          For private or age-restricted content, and required for every Vimeo link right now
-          {#if cookiesInfo?.configured}
-            — configured {when(cookiesInfo.updated_at)}
-          {:else if cookiesInfo}
-            — not configured
-          {/if}
-          . Exported from a browser extension, Netscape format. Stored encrypted; never shown back once saved.
-        </p>
-        <textarea rows="3" placeholder="Paste a cookies.txt export here" bind:value={cookiesText} aria-label="Cookies"></textarea>
-        <div class="sheet-actions">
-          <button class="btn" onclick={saveCookies} disabled={cookiesBusy || !cookiesText.trim()}>
-            {cookiesBusy ? 'Saving…' : 'Save cookies'}
-          </button>
-          {#if cookiesInfo?.configured}
-            <button class="btn ghost" onclick={clearCookies} disabled={cookiesBusy}>Clear</button>
-          {/if}
-        </div>
-        {#if cookiesMessage}<p class="dim tiny">{cookiesMessage}</p>{/if}
+        <h3 class="section-title">Connections</h3>
+        <button class="nav-row" onclick={() => (accountView = 'connections')}>
+          <span class="conn-strip" aria-hidden="true">
+            {#each connections ?? [] as c (c.source)}
+              <span class="conn-strip-glyph" class:on={c.configured}>
+                <SourceIcon name={c.source} size={18} />
+              </span>
+            {/each}
+          </span>
+          <span class="meta">
+            <strong>Cookies per site</strong>
+            <span class="dim tiny">
+              {connectionsConfigured === null
+                ? 'Sign-ins for private content'
+                : `${connectionsConfigured} of ${connections.length} configured`}
+            </span>
+          </span>
+          <Icon name="chevron-right" />
+        </button>
 
         <h3 class="section-title">Offline readiness</h3>
         <dl class="diag">
@@ -1944,6 +2163,7 @@
           · yt-dlp {health?.yt_dlp_version ?? '…'}
         </p>
       </div>
+      {/if}
     </div>
   {/if}
 
@@ -2877,6 +3097,173 @@
     align-items: center;
     gap: 12px;
     margin-bottom: 12px;
+  }
+
+  /* ---- connections (per-site cookie jars) ------------------------------ */
+  .nav-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 56px;
+    padding: 8px 4px;
+    background: transparent;
+    border: 0;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+  }
+  .nav-row .meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  /* The five marks, dimmed until configured — a glance at the Account root
+     says how many sites are set up without opening anything. */
+  .conn-strip {
+    display: flex;
+    gap: 2px;
+    flex: none;
+  }
+  .conn-strip-glyph {
+    color: var(--text-faint);
+    opacity: 0.5;
+    display: inline-flex;
+  }
+  .conn-strip-glyph.on {
+    color: var(--text);
+    opacity: 1;
+  }
+
+  .conn-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin: 12px 0 4px;
+  }
+  @media (min-width: 560px) {
+    .conn-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+  .conn-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    min-height: 104px;
+    padding: 14px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    /* Only transform/opacity, and nothing that changes the tile's box —
+       a press must not reflow the grid around it. */
+    transition: transform 120ms ease-out;
+  }
+  .conn-tile:active {
+    transform: scale(0.97);
+  }
+  .conn-name {
+    font-weight: 600;
+    margin-top: auto;
+  }
+  .conn-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  /* Paired with a word, never carrying the meaning alone. */
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    flex: none;
+    background: var(--text-faint);
+  }
+  .dot.good {
+    background: var(--good);
+  }
+  .dot.warn {
+    background: var(--warn);
+  }
+  .dot.bad {
+    background: var(--danger);
+  }
+
+  .conn-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px;
+    margin-bottom: 4px;
+    border-radius: var(--radius-md);
+    background: var(--surface);
+  }
+  .conn-head .meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .conn-glyph {
+    width: 40px;
+    height: 40px;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  .steps {
+    margin: 4px 0;
+    padding-left: 20px;
+    color: var(--text-dim);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .steps li {
+    margin-bottom: 6px;
+  }
+  .steps li::marker {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .callout {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin: 10px 0;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    border: 1px solid var(--warn-soft-border);
+    border-radius: var(--radius-sm);
+    background: var(--warn-soft-bg);
+    color: var(--warn-soft-text);
+  }
+  .callout :global(svg) {
+    flex: none;
+    margin-top: 1px;
+  }
+  .field-label {
+    display: block;
+    margin-top: 16px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  textarea.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre;
   }
   .avatar-lg {
     width: 44px;

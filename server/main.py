@@ -83,11 +83,11 @@ _resolve_pool: ProcessPoolExecutor | None = None
 _job_pool: ProcessPoolExecutor | None = None
 _stop = threading.Event()
 
-# The per-user cookie jar (private/age-gated content) is encrypted at rest
-# with this key. Set PWA_YT_COOKIE_KEY explicitly in any deployment that must
-# survive a restart — an auto-generated key here is session-only, and cookies
-# saved under a since-discarded key just decrypt as "not configured" rather
-# than crashing anything (see _user_cookies below).
+# The per-user, per-integration cookie jars (private/age-gated content, D-031)
+# are encrypted at rest with this key. Set PWA_YT_COOKIE_KEY explicitly in any
+# deployment that must survive a restart — an auto-generated key here is
+# session-only, and cookies saved under a since-discarded key just decrypt as
+# "not configured" rather than crashing anything (see _user_cookies below).
 _COOKIE_KEY_ENV = "PWA_YT_COOKIE_KEY"
 _cookie_key = os.environ.get(_COOKIE_KEY_ENV)
 if not _cookie_key:
@@ -229,23 +229,96 @@ def _usage_today(user_id: str) -> int:
     return row["bytes"] if row else 0
 
 
-def _user_cookies(user_id: str) -> str | None:
-    """Decrypted only for the lifetime of one resolve/download call — never
+def _user_cookies(user_id: str, source: str | None) -> str | None:
+    """This user's jar for one integration, or None.
+
+    Decrypted only for the lifetime of one resolve/download call — never
     written anywhere except a job's own scratch dir (pipeline.py) or a temp
     file cleaned up immediately after (extract.py). A decrypt failure (key
     rotated since these were saved) is treated as "no cookies configured"
     rather than raised — a resolve or download that doesn't need private
-    content must not fail because of one that's now unreadable."""
+    content must not fail because of one that's now unreadable.
+
+    `source` is None when the caller couldn't tell which site a URL belongs to.
+    That's not an error: it means no jar applies, and an unrecognised host is
+    about to be refused by the extractor allowlist anyway.
+    """
+    if source is None:
+        return None
     with db.reading() as conn:
         row = conn.execute(
-            "SELECT cookies_encrypted FROM users WHERE id = ?", (user_id,)
+            "SELECT cookies_encrypted FROM user_cookies WHERE user_id = ? AND source = ?",
+            (user_id, source),
         ).fetchone()
-    if not row or not row["cookies_encrypted"]:
+    if not row:
         return None
     try:
         return _fernet.decrypt(bytes(row["cookies_encrypted"])).decode()
     except InvalidToken:
         return None
+
+
+def _migrate_legacy_cookie_jar() -> None:
+    """One-time: split the old single per-user jar (D-020) into per-source jars.
+
+    The old blob is Netscape text, and Netscape lines carry their own domain,
+    so the split is exactly the filter a save does now — nobody has to re-paste.
+    Lines belonging to no supported source are dropped, which is the point.
+    A jar that no longer decrypts is dropped with the columns; there is nothing
+    to recover from it. Deletes the columns afterwards, so this is a no-op on
+    every later start.
+    """
+    with db.reading() as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        if "cookies_encrypted" not in columns:
+            return
+        legacy = conn.execute(
+            "SELECT id, cookies_encrypted FROM users WHERE cookies_encrypted IS NOT NULL"
+        ).fetchall()
+
+    now_epoch = time.time()
+    moved = 0
+    for row in legacy:
+        try:
+            text = _fernet.decrypt(bytes(row["cookies_encrypted"])).decode()
+        except (InvalidToken, UnicodeDecodeError):
+            continue
+        for source in extract.SOURCES:
+            try:
+                filtered, expiry = extract.filter_cookies(text, source, now_epoch)
+            except ValueError:
+                continue  # nothing in the old jar for this source
+            _store_cookies(row["id"], source, filtered, expiry)
+            moved += 1
+
+    with db.writing() as conn:
+        conn.execute("ALTER TABLE users DROP COLUMN cookies_encrypted")
+        conn.execute("ALTER TABLE users DROP COLUMN cookies_updated_at")
+    print(
+        f"[cookies] migrated the legacy jar for {len(legacy)} user(s) into "
+        f"{moved} per-source jar(s); dropped users.cookies_encrypted.",
+        flush=True,
+    )
+
+
+def _store_cookies(user_id: str, source: str, text: str, expiry_epoch: int | None) -> None:
+    expires_at = (
+        datetime.fromtimestamp(expiry_epoch, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+        if expiry_epoch
+        else None
+    )
+    with db.writing() as conn:
+        conn.execute(
+            """INSERT INTO user_cookies (user_id, source, cookies_encrypted, updated_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (user_id, source) DO UPDATE SET
+                    cookies_encrypted = excluded.cookies_encrypted,
+                    updated_at        = excluded.updated_at,
+                    expires_at        = excluded.expires_at""",
+            (user_id, source, _fernet.encrypt(text.encode()), db.now(), expires_at),
+        )
 
 
 def _finish(
@@ -410,13 +483,17 @@ def _runner() -> None:
         try:
             with db.reading() as conn:
                 row = conn.execute(
-                    """SELECT s.source_key, s.canonical_url, i.format_profile
+                    """SELECT s.source_key, s.extractor, s.canonical_url, i.format_profile
                          FROM library_items i JOIN sources s ON s.source_key = i.source_key
                         WHERE i.id = ?""",
                     (job["item_id"],),
                 ).fetchone()
             profile = json.loads(row["format_profile"])
-            cookies_text = _user_cookies(job["user_id"])
+            # The extractor is already known here, so the jar is picked exactly:
+            # this download gets one site's cookies, never the user's others.
+            cookies_text = _user_cookies(
+                job["user_id"], extract.source_for_extractor(row["extractor"])
+            )
             future = _job_pool.submit(
                 pipeline.run, row["canonical_url"], profile, str(scratch_dir), cookies_text
             )
@@ -532,6 +609,7 @@ def _reap_missing_artifacts() -> None:
 async def lifespan(_: FastAPI):
     global _resolve_pool, _job_pool
     db.init()
+    _migrate_legacy_cookie_jar()
     SCRATCH.mkdir(parents=True, exist_ok=True)
     _sweep_orphan_scratch()
     _reap_missing_artifacts()
@@ -568,7 +646,7 @@ _enable_docs = os.environ.get("PWA_YT_ENABLE_DOCS", "").lower() in ("1", "true",
 
 app = FastAPI(
     title="PWA-YT",
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
     docs_url="/docs" if _enable_docs else None,
     redoc_url="/redoc" if _enable_docs else None,
@@ -710,38 +788,60 @@ class CookiesRequest(BaseModel):
     # Netscape cookie-file format — exactly what yt-dlp's `cookiefile` option
     # (and browser extensions that export cookies) already produce. Real
     # exports are a few KB even with hundreds of cookies; 256 KiB is
-    # generous headroom without leaving the column an unbounded BLOB.
+    # generous headroom without leaving the column an unbounded BLOB. The cap
+    # is on what's *submitted*: filtering to one source only shrinks it.
     cookies: str = Field(min_length=1, max_length=256 * 1024)
-
-
-@app.put("/me/cookies")
-def put_cookies(req: CookiesRequest, user: dict = Depends(auth.current_user)):
-    encrypted = _fernet.encrypt(req.cookies.encode())
-    with db.writing() as conn:
-        conn.execute(
-            "UPDATE users SET cookies_encrypted = ?, cookies_updated_at = ? WHERE id = ?",
-            (encrypted, db.now(), user["id"]),
-        )
-    return {"ok": True}
 
 
 @app.get("/me/cookies")
 def get_cookies_status(user: dict = Depends(auth.current_user)):
-    # Write-only from the client's perspective — this reports whether cookies
-    # are configured and when, never the plaintext (or ciphertext) back out.
+    # Write-only from the client's perspective — this reports whether each
+    # integration has a jar and when it goes stale, never the plaintext (or
+    # ciphertext) back out. Every supported source is listed, configured or
+    # not, so the client renders the full grid from one request and doesn't
+    # need its own copy of the source list.
     with db.reading() as conn:
-        row = conn.execute(
-            "SELECT cookies_updated_at FROM users WHERE id = ?", (user["id"],)
-        ).fetchone()
-    return {"configured": row["cookies_updated_at"] is not None, "updated_at": row["cookies_updated_at"]}
+        rows = {
+            r["source"]: r
+            for r in conn.execute(
+                "SELECT source, updated_at, expires_at FROM user_cookies WHERE user_id = ?",
+                (user["id"],),
+            )
+        }
+    return [
+        {
+            "source": key,
+            "label": meta["label"],
+            "cookies": meta["cookies"],
+            "configured": key in rows,
+            "updated_at": rows[key]["updated_at"] if key in rows else None,
+            "expires_at": rows[key]["expires_at"] if key in rows else None,
+        }
+        for key, meta in extract.SOURCES.items()
+    ]
 
 
-@app.delete("/me/cookies")
-def delete_cookies(user: dict = Depends(auth.current_user)):
+@app.put("/me/cookies/{source}")
+def put_cookies(source: str, req: CookiesRequest, user: dict = Depends(auth.current_user)):
+    if source not in extract.SOURCES:
+        return error(404, "not_found", f"{source!r} is not a supported integration.")
+    try:
+        filtered, expiry = extract.filter_cookies(req.cookies, source, time.time())
+    except ValueError as err:
+        # The two ways a paste goes wrong (wrong format, wrong site) are both
+        # things the user can fix, and the message says which one it was.
+        return error(400, "invalid_cookies", str(err))
+    _store_cookies(user["id"], source, filtered, expiry)
+    return {"ok": True}
+
+
+@app.delete("/me/cookies/{source}")
+def delete_cookies(source: str, user: dict = Depends(auth.current_user)):
+    if source not in extract.SOURCES:
+        return error(404, "not_found", f"{source!r} is not a supported integration.")
     with db.writing() as conn:
         conn.execute(
-            "UPDATE users SET cookies_encrypted = NULL, cookies_updated_at = NULL WHERE id = ?",
-            (user["id"],),
+            "DELETE FROM user_cookies WHERE user_id = ? AND source = ?", (user["id"], source)
         )
     return {"ok": True}
 
@@ -810,8 +910,14 @@ def resolve(req: ResolveRequest, user: dict = Depends(auth.current_user)):
         )
 
     try:
+        # Nothing has resolved the extractor yet, so the jar is chosen by URL
+        # host. An unrecognised host gets no cookies and is about to be refused
+        # by the extractor allowlist regardless.
         kind, payload = _resolve_pool.submit(
-            extract.probe, req.url, req.format_profile.audio_bitrate, _user_cookies(user["id"])
+            extract.probe,
+            req.url,
+            req.format_profile.audio_bitrate,
+            _user_cookies(user["id"], extract.source_for_url(req.url)),
         ).result(timeout=RESOLVE_TIMEOUT_S)
     except FutureTimeout:
         return error(

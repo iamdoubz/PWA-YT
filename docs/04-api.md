@@ -148,9 +148,14 @@ re-issues the original REST call. See D-018 and D-020.
 |---|---|---|
 | `GET` | `/me` | Profile, daily byte budget, concurrency limit. |
 | `GET` | `/me/usage` | `{bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs}`. |
-| `PUT` | `/me/cookies` | `{cookies}` — Netscape cookie-file text. Encrypted at rest (Fernet); never returned once saved. |
-| `GET` | `/me/cookies` | `{configured, updated_at}` only — write-only from the client's perspective. |
-| `DELETE` | `/me/cookies` | Clears the jar. |
+| `GET` | `/me/cookies` | `[{source, label, cookies, configured, updated_at, expires_at}]` — every supported integration, configured or not, so the client renders its whole Connections grid from one call and keeps no source list of its own. Write-only from the client's perspective: never the jar itself. |
+| `PUT` | `/me/cookies/{source}` | `{cookies}` — Netscape cookie-file text. **Filtered to `{source}`'s own domains before it is stored**, then encrypted at rest (Fernet). `404` unknown source, `422` over 256 KiB (D-023), `400` if it isn't Netscape format or has no unexpired cookies for that source. |
+| `DELETE` | `/me/cookies/{source}` | Clears that one jar. |
+
+Cookies are per-integration, not per-user (D-031). A resolve picks the jar by
+URL host; a download job picks it by the already-known `sources.extractor`.
+An unrecognised host gets no jar and is about to be refused by the extractor
+allowlist anyway.
 
 **`PUT /me/settings` was not built.** There is no per-user setting yet worth
 a dedicated endpoint — client-transcode preference is a v1.0 concept, and
