@@ -32,11 +32,28 @@ CREATE TABLE IF NOT EXISTS users (
   daily_byte_budget   INTEGER NOT NULL DEFAULT 5368709120,
   max_concurrent      INTEGER NOT NULL DEFAULT 2,
   created_at          TEXT NOT NULL,
-  disabled_at         TEXT,
-  -- Fernet-encrypted (see main.py); write-only from the client's perspective
-  -- — there is no endpoint that ever returns the plaintext back out.
-  cookies_encrypted   BLOB,
-  cookies_updated_at  TEXT
+  disabled_at         TEXT
+  -- cookies_encrypted/cookies_updated_at used to live here, one jar per user.
+  -- They moved to user_cookies (one jar per integration) — see D-031 and
+  -- main._migrate_legacy_cookie_jar, which splits an old jar by domain and
+  -- drops the columns. A database created after that change never has them.
+);
+
+-- One cookie jar per user per integration, not one per user. Fernet-encrypted
+-- (see main.py) and write-only from the client's perspective: no endpoint ever
+-- returns the plaintext back out. `source` is a key of extract.SOURCES, and
+-- what's stored has already been filtered down to that source's own domains,
+-- so a YouTube job cannot be handed the user's SoundCloud session.
+CREATE TABLE IF NOT EXISTS user_cookies (
+  user_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source            TEXT NOT NULL,
+  cookies_encrypted BLOB NOT NULL,
+  updated_at        TEXT NOT NULL,
+  -- Soonest expiry among the stored cookies, ISO 8601 UTC; NULL when they are
+  -- all session cookies. Exists so the UI can warn before a jar goes stale —
+  -- silently expired cookies are the failure mode users can't diagnose.
+  expires_at        TEXT,
+  PRIMARY KEY (user_id, source)
 );
 
 CREATE TABLE IF NOT EXISTS credentials (

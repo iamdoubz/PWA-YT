@@ -1,0 +1,6 @@
+# Shell scripts must stay LF even when checked out on Windows. app/Dockerfile
+# COPYs docker-entrypoint.d/*.sh straight from the working tree, and CRLF there
+# makes the container fail with "bad interpreter: /bin/sh^M". CI checks out on
+# Linux so it would only ever break for someone building locally on Windows —
+# the worst kind of bug to leave lying around.
+*.sh text eol=lf

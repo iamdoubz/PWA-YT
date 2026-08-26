@@ -164,10 +164,14 @@ export const sync = (cursor) => request(`/sync?since=${encodeURIComponent(cursor
 
 export const me = () => request('/me');
 export const meUsage = () => request('/me/usage');
-export const putCookies = (cookies) =>
-  request('/me/cookies', { method: 'PUT', body: JSON.stringify({ cookies }) });
+// One jar per integration, not one per user. The status call returns every
+// supported source (configured or not), so the client renders the whole grid
+// from one request and keeps no source list of its own.
 export const cookiesStatus = () => request('/me/cookies');
-export const deleteCookies = () => request('/me/cookies', { method: 'DELETE' });
+export const putCookies = (source, cookies) =>
+  request(`/me/cookies/${source}`, { method: 'PUT', body: JSON.stringify({ cookies }) });
+export const deleteCookies = (source) =>
+  request(`/me/cookies/${source}`, { method: 'DELETE' });
 
 // Unauthenticated — the Account sheet's version footer needs it whether or
 // not a session is still valid.

@@ -4,6 +4,10 @@
 # OPFS/service worker/home-screen install without it.
 services:
   server:
+    # `docker compose up -d` pulls this from GHCR; `up -d --build` builds it
+    # from source under the same tag. Set PWA_YT_TAG to pin a release
+    # (e.g. 0.9.0) instead of tracking latest.
+    image: ghcr.io/iamdoubz/pwa-yt-server:${PWA_YT_TAG:-latest}
     build:
       context: ./server
       platforms: [linux/amd64]
@@ -20,10 +24,16 @@ services:
       - /app/scratch
 
   app:
+    image: ghcr.io/iamdoubz/pwa-yt-app:${PWA_YT_TAG:-latest}
     build:
       context: ./app
       platforms: [linux/amd64]
     platform: linux/amd64
+    environment:
+      # Applied at container start, so this works on a pulled image and takes
+      # effect on `docker compose up -d` with no rebuild. Blank is fine — the
+      # link-preview URLs stay relative. See app/docker-entrypoint.d/.
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
     restart: unless-stopped
     depends_on:
       server:

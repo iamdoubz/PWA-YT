@@ -575,7 +575,121 @@ def test_usage_ledger_accumulates_and_gates_new_jobs():
     assert json.loads(resp.body)["error"] == "quota_exceeded"
 
 
-def test_cookie_jar_round_trips_and_survives_key_rotation():
+def _cookie_line(domain, name, value, expiry=0):
+    return f"{domain}\tTRUE\t/\tFALSE\t{expiry}\t{name}\t{value}"
+
+
+# A realistic paste: the user exported everything, not just the site we asked
+# for. That is the input this whole feature is built to handle safely.
+FAR = 4102444800  # 2100-01-01
+SOON = 4102358400  # a day earlier — the soonest live expiry below
+MIXED_EXPORT = "\n".join(
+    [
+        "# Netscape HTTP Cookie File",
+        "",
+        _cookie_line(".youtube.com", "LOGIN_INFO", "yt-secret", FAR),
+        "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t%d\t__Secure-1PSID\tsecret" % SOON,
+        _cookie_line(".youtube.com", "SESSION_ONLY", "no-expiry"),
+        _cookie_line(".youtu.be", "SHORT", "link", FAR),
+        _cookie_line(".youtube.com", "STALE", "long-gone", 1000000000),  # 2001
+        _cookie_line(".soundcloud.com", "oauth_token", "sc-secret", FAR),
+        _cookie_line(".bank.example", "SESSION", "do-not-store", FAR),
+        _cookie_line("mail.google.com", "SID", "do-not-store", FAR),
+    ]
+)
+
+
+def test_cookie_filter_keeps_only_the_target_sources_domains():
+    """The security claim of D-031, pinned. A whole-browser export must come
+    out of the filter holding one site's cookies and nothing else."""
+    text, expires = extract.filter_cookies(MIXED_EXPORT, "youtube", now_epoch=1700000000)
+
+    assert text.startswith("# Netscape HTTP Cookie File"), "yt-dlp needs the header"
+    assert "yt-secret" in text and "SESSION_ONLY" in text and "SHORT" in text
+    # The whole point: other sites' cookies are gone, including Google's own —
+    # YouTube auth is Google auth, and storing google.com would drag Gmail in.
+    assert "sc-secret" not in text, "SoundCloud cookies leaked into the YouTube jar"
+    assert "do-not-store" not in text, "unrelated site cookies were stored"
+    # Already-expired lines are dropped: yt-dlp ignores them anyway and they
+    # would drag the expiry estimate into the past.
+    assert "long-gone" not in text
+    assert "#HttpOnly_" in text, "the HttpOnly prefix must survive; yt-dlp reads it"
+    assert expires == SOON, "expiry must be the soonest *live* cookie, not the soonest line"
+
+    # ...and the same export filed under SoundCloud gets the opposite half.
+    sc_text, _ = extract.filter_cookies(MIXED_EXPORT, "soundcloud", now_epoch=1700000000)
+    assert "sc-secret" in sc_text and "yt-secret" not in sc_text
+
+
+def test_filtered_cookies_load_back_through_yt_dlps_own_parser():
+    """The format check that actually matters: what we store has to survive
+    the loader yt-dlp really uses. Both easy mistakes here are silent — a bad
+    header and the whole jar is ignored, a mangled #HttpOnly_ line and
+    `__Secure-1PSID` (the YouTube auth cookie, HttpOnly *and* session-scoped)
+    goes missing while everything still looks fine."""
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    text, _ = extract.filter_cookies(MIXED_EXPORT, "youtube", now_epoch=1700000000)
+    path = Path(tempfile.mkdtemp()) / "cookies.txt"
+    path.write_text(text)
+
+    jar = YoutubeDLCookieJar(str(path))
+    jar.load()  # exactly the call yt_dlp.cookies.load_cookies makes — no flags
+    loaded = {c.name for c in jar}
+
+    assert "__Secure-1PSID" in loaded, "HttpOnly session cookie was lost in translation"
+    assert "SESSION_ONLY" in loaded, "session cookies must survive; yt-dlp keeps them"
+    assert "LOGIN_INFO" in loaded
+    assert {c.domain for c in jar} <= {".youtube.com", ".youtu.be"}
+    # yt-dlp loads with ignore_expires=True, so it would happily send a stale
+    # cookie. Dropping expired lines at save time is ours to do, not its.
+    assert "STALE" not in loaded
+
+
+def test_cookie_filter_rejects_the_two_ways_a_paste_goes_wrong():
+    import json as _json
+
+    try:
+        extract.filter_cookies(_json.dumps([{"name": "a"}]), "youtube", now_epoch=0)
+        raise AssertionError("a JSON export should be refused, not stored")
+    except ValueError as err:
+        assert "Netscape" in str(err), err
+
+    # Right format, wrong site — silently storing an empty jar here would look
+    # like success and fail much later, at download time.
+    only_sc = "\n".join(["# Netscape HTTP Cookie File", _cookie_line(".soundcloud.com", "a", "b", FAR)])
+    try:
+        extract.filter_cookies(only_sc, "youtube", now_epoch=1700000000)
+        raise AssertionError("an export with no YouTube cookies should be refused")
+    except ValueError as err:
+        assert "YouTube" in str(err), err
+
+    # All session cookies is legitimate — no expiry to report, still a jar.
+    sessions = "\n".join(["# Netscape HTTP Cookie File", _cookie_line(".vimeo.com", "a", "b")])
+    text, expires = extract.filter_cookies(sessions, "vimeo", now_epoch=1700000000)
+    assert "a\tb" in text and expires is None
+
+
+def test_a_url_and_an_extractor_both_resolve_to_the_same_source():
+    """The two ways a jar gets picked — by host before resolve, by extractor
+    after — must agree, or a track resolves with cookies and downloads without."""
+    assert extract.source_for_url("https://www.youtube.com/watch?v=x") == "youtube"
+    assert extract.source_for_url("https://youtu.be/x") == "youtube"
+    assert extract.source_for_url("https://artist.bandcamp.com/track/x") == "bandcamp"
+    assert extract.source_for_url("https://evil.example/x") is None
+    assert extract.source_for_url("not a url") is None
+
+    for extractor, expected in [
+        ("Youtube", "youtube"), ("youtube:tab", "youtube"),
+        ("Bandcamp:album", "bandcamp"), ("vimeo:user", "vimeo"),
+        ("SoundCloud", "soundcloud"), ("mixcloud:playlist", "mixcloud"),
+    ]:
+        assert extract.source_for_extractor(extractor) == expected, extractor
+    assert extract.source_for_extractor("generic") is None
+    assert extract.source_for_extractor("") is None
+
+
+def test_cookie_jars_are_per_source_and_survive_key_rotation():
     import main
     from cryptography.fernet import Fernet
 
@@ -586,24 +700,81 @@ def test_cookie_jar_round_trips_and_survives_key_rotation():
             (user_id, f"{user_id}@example.com", "Cookie Test", db.now()),
         )
 
-    assert main._user_cookies(user_id) is None, "no cookies configured yet"
+    assert main._user_cookies(user_id, "youtube") is None, "no cookies configured yet"
+    assert main._user_cookies(user_id, None) is None, "an unrecognised host gets no jar"
 
-    cookie_text = "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tfoo\tbar\n"
-    encrypted = main._fernet.encrypt(cookie_text.encode())
-    with db.writing() as conn:
-        conn.execute(
-            "UPDATE users SET cookies_encrypted = ?, cookies_updated_at = ? WHERE id = ?",
-            (encrypted, db.now(), user_id),
-        )
-    assert main._user_cookies(user_id) == cookie_text
+    yt, expiry = extract.filter_cookies(MIXED_EXPORT, "youtube", now_epoch=1700000000)
+    sc, _ = extract.filter_cookies(MIXED_EXPORT, "soundcloud", now_epoch=1700000000)
+    main._store_cookies(user_id, "youtube", yt, expiry)
+    main._store_cookies(user_id, "soundcloud", sc, None)
+
+    # A job for one source must never be handed another source's jar.
+    assert main._user_cookies(user_id, "youtube") == yt
+    assert "sc-secret" not in main._user_cookies(user_id, "youtube")
+    assert main._user_cookies(user_id, "soundcloud") == sc
+    assert main._user_cookies(user_id, "vimeo") is None, "unconfigured sources stay empty"
+
+    with db.reading() as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM user_cookies WHERE user_id = ? AND source = 'youtube'",
+            (user_id,),
+        ).fetchone()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", row["expires_at"])
+
+    # Re-saving replaces rather than duplicating (the PK conflict path).
+    main._store_cookies(user_id, "youtube", sc, None)
+    with db.reading() as conn:
+        rows = conn.execute(
+            "SELECT * FROM user_cookies WHERE user_id = ? AND source = 'youtube'", (user_id,)
+        ).fetchall()
+    assert len(rows) == 1 and rows[0]["expires_at"] is None
 
     # A key rotation must degrade to "not configured", not raise — a resolve
     # for a user whose old cookies no longer decrypt must still work for
     # everything that isn't gated behind those cookies.
     stale = Fernet(Fernet.generate_key()).encrypt(b"irrelevant")
     with db.writing() as conn:
-        conn.execute("UPDATE users SET cookies_encrypted = ? WHERE id = ?", (stale, user_id))
-    assert main._user_cookies(user_id) is None
+        conn.execute(
+            "UPDATE user_cookies SET cookies_encrypted = ? WHERE user_id = ? AND source = 'youtube'",
+            (stale, user_id),
+        )
+    assert main._user_cookies(user_id, "youtube") is None
+
+
+def test_legacy_single_jar_migrates_into_per_source_jars():
+    """D-031's upgrade path. Runs once, in the wild, against a database this
+    test suite never creates — so simulate the old shape and drive it."""
+    import main
+
+    with db.writing() as conn:
+        conn.execute("ALTER TABLE users ADD COLUMN cookies_encrypted BLOB")
+        conn.execute("ALTER TABLE users ADD COLUMN cookies_updated_at TEXT")
+
+    user_id = db.uuid7()
+    with db.writing() as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, display_name, created_at, cookies_encrypted)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                user_id, f"{user_id}@example.com", "Legacy", db.now(),
+                main._fernet.encrypt(MIXED_EXPORT.encode()),
+            ),
+        )
+
+    main._migrate_legacy_cookie_jar()
+
+    assert "yt-secret" in main._user_cookies(user_id, "youtube")
+    assert "sc-secret" in main._user_cookies(user_id, "soundcloud")
+    assert main._user_cookies(user_id, "bandcamp") is None, "no bandcamp lines to migrate"
+    # The unrelated sites in the old jar are not carried over anywhere.
+    for source in extract.SOURCES:
+        jar = main._user_cookies(user_id, source)
+        assert jar is None or "do-not-store" not in jar
+
+    with db.reading() as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    assert "cookies_encrypted" not in columns, "the legacy columns must be dropped"
+    main._migrate_legacy_cookie_jar()  # idempotent: a no-op once the columns are gone
 
 
 def test_sync_returns_incremental_changes_with_a_working_cursor():

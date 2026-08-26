@@ -1088,3 +1088,89 @@ same one-line addition D-022 always described. Vimeo: if
 yt-dlp/Vimeo restore anonymous access, the canary starts passing on its own
 and the cookie requirement can be dropped from the UI copy; nothing else
 would need to change.
+
+## D-031 · Cookies are per-integration, not per-user
+
+**Status:** accepted · 2026-08-26
+
+**Decision.** The single per-user cookie jar (D-020) becomes one jar per
+user per supported source. `users.cookies_encrypted` /
+`cookies_updated_at` are replaced by a `user_cookies` table keyed
+`(user_id, source)`; `PUT`/`DELETE /me/cookies` become
+`/me/cookies/{source}`; `GET /me/cookies` returns a row per supported
+source instead of one boolean. `extract.SOURCES` becomes the single
+registry that `ALLOWED_EXTRACTORS` is derived from.
+
+**This is a security change first and a menu second.** The old jar was
+whatever the user pasted — in practice a whole-browser export, because
+that is what "Get cookies.txt" extensions produce by default — and *all*
+of it was handed to yt-dlp on *every* job regardless of site. A YouTube
+download carried the user's entire browser session to YouTube. Two things
+close that:
+
+- **Filter on write.** A save keeps only the lines whose domain belongs to
+  the integration being saved and discards the rest *before* encryption, so
+  the unrelated cookies are never stored at all. An export with nothing for
+  that source is a `400` with a specific message, not a silently empty jar.
+- **Select on read.** A job loads one jar. `/resolve` picks it by URL host
+  (nothing has resolved the extractor yet); the runner picks it by the
+  already-stored `sources.extractor`, matched with the same
+  case-insensitive full match yt-dlp applies, so sub-extractors
+  (`Bandcamp:album`, `vimeo:user`) map to their parent.
+
+**YouTube's domains are `.youtube.com` and `.youtu.be` — deliberately not
+`.google.com`.** YouTube auth *is* Google auth, so a google.com export
+carries the same session as Gmail and Drive. The cookies yt-dlp actually
+needs (`SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `LOGIN_INFO`,
+`__Secure-*PSID`) are all set on `.youtube.com` too, so the narrower domain
+costs nothing and stores dramatically less. Cost: an export taken from a
+google.com tab is refused, with a message saying to export from a YouTube
+tab.
+
+**Expired lines are dropped at save time, and expiry is tracked.**
+yt-dlp loads a cookiefile with `ignore_expires=True`
+(`yt_dlp/cookies.py` `load_cookies` → `jar.load()` with no arguments), so
+it does *not* discard stale cookies for us — it would send them. Dropping
+them is ours to do. The soonest surviving expiry is stored as
+`user_cookies.expires_at` so the UI can warn before a jar goes stale;
+silently expired cookies were the failure mode a user could not diagnose
+from inside the app. Session cookies (expiry `0`) are kept — `__Secure-1PSID`
+is one, and it is exactly what YouTube auth rides on.
+
+**The stored format is verified against yt-dlp's own parser**, not
+eyeballed: `test_filtered_cookies_load_back_through_yt_dlps_own_parser`
+writes a filtered jar and loads it with `YoutubeDLCookieJar.load()` exactly
+as `load_cookies` does. Both ways this format breaks are silent — a wrong
+header and the whole jar is ignored, a mangled `#HttpOnly_` line and
+`__Secure-1PSID` goes missing while everything still looks fine.
+
+**Migration is automatic.** Netscape lines carry their own domain, so the
+old blob splits with the same filter a save uses:
+`_migrate_legacy_cookie_jar()` runs once at startup, writes per-source
+jars, drops the two columns, and is a no-op forever after. Nobody re-pastes,
+and lines belonging to no supported source are dropped in the process — the
+migration itself shrinks what is stored.
+
+**Client.** The Account sheet gains a three-level stack (`accountView`:
+root → connections → one source) rather than a second sheet on top of a
+sheet, which would have left Escape ambiguous and lost the way back to
+Account. The picker is a tile grid of monochrome brand marks
+(`SourceIcon.svelte`, hand-authored, self-hosted, no CDN — same rules as
+`Icon.svelte`, different visual layer, see the comment in the file);
+per-source instructions live client-side as UI copy so they are readable
+from the precached shell. Status is always a dot *plus* a word — never
+colour alone.
+
+**Not done.** Instagram and TikTok were asked for and are not here: neither
+is in `ALLOWED_EXTRACTORS`, so a tile for either would open a paste box for
+cookies the server would never use, and adding them means the D-030 live
+verification, not a registry line. Adding a source is now that one registry
+line plus that verification. The cookie-jar audit log flagged in
+`10-security-audit.md` (no log of login or cookie-jar changes) is still
+absent — this change makes it more worth having, not less.
+
+**What would change this.** If Vimeo restores anonymous access its entry
+drops from `required` to `optional` — a one-word registry change, and the
+UI copy follows on its own. If yt-dlp ever grows per-request cookie
+scoping, the filter-on-write half stays worth keeping regardless: not
+storing a cookie is stronger than not sending one.

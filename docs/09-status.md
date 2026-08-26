@@ -2,6 +2,8 @@
 
 **As of:** 2026-08-23 · commit `e7084af` + uncommitted hardening (D-027)
 **Name:** the project was briefly codenamed *Tarmac*; it is **PWA-YT** everywhere now
+**Later than this header:** per-integration cookie jars shipped 2026-08-26
+(v0.9, D-031) — see §2. Sources grew to five on 2026-08-25 (D-030).
 **Phases claimed complete:** v0.0 (added), v0.1, v0.2, v0.3, v0.4. All five
 v0.4 subsystems are now built: passkeys + invites + sessions, per-user
 budgets + usage ledger, multi-device `/sync`, the encrypted cookie jar, and
@@ -344,9 +346,9 @@ server/                       stateless transformer — never a media library
 | `POST` | `/auth/logout` | invalidates the session server-side only |
 | `GET` | `/me` | profile, `daily_byte_budget`, `max_concurrent` |
 | `GET` | `/me/usage` | `{bytes_used_today, daily_byte_budget, remaining_bytes, active_jobs}` |
-| `PUT` | `/me/cookies` | `{cookies}` (Netscape format) → Fernet-encrypted at rest |
-| `GET` | `/me/cookies` | `{configured, updated_at}` — write-only, never returns the jar |
-| `DELETE` | `/me/cookies` | clears it |
+| `GET` | `/me/cookies` | one row per supported source: `{source, label, cookies, configured, updated_at, expires_at}` — write-only, never returns a jar |
+| `PUT` | `/me/cookies/{source}` | `{cookies}` (Netscape format) → filtered to that source's domains, then Fernet-encrypted at rest (D-031) |
+| `DELETE` | `/me/cookies/{source}` | clears that one jar |
 | `GET` | `/sync?since={cursor}` | changed rows + tombstones across items/playlists/playlist_items; opaque per-table cursor (D-020) |
 
 Every endpoint above `/auth/*`, `/health`, and `/health/extractors` now
@@ -454,6 +456,28 @@ from an already-authenticated session, so a magic-link sign-in doesn't
 recover a device's ability to log in with a passkey again — see D-028's
 "What this does not do."
 
+### Per-integration cookie jars, built 2026-08-26 (v0.9)
+
+D-031. The single per-user jar became one jar per user per supported source:
+`user_cookies` replaces two columns on `users`, `extract.SOURCES` becomes the
+registry `ALLOWED_EXTRACTORS` derives from, and a save is filtered to that
+source's own domains *before* it is encrypted. That last part is the point —
+a whole-browser export used to be stored whole and handed to yt-dlp on every
+job, so a YouTube download carried the user's entire browser session.
+YouTube's jar is `.youtube.com`/`.youtu.be` and deliberately not
+`.google.com` (same session as Gmail; the cookies yt-dlp needs are on
+youtube.com too). Client: Account → Connections, a tile grid of monochrome
+brand marks with per-site instructions and status.
+
+Verified live against a running server with a real magic-link session — save
+(with an unrelated `bank.example` cookie in the same paste, confirmed
+stripped), wrong-site refusal, list, delete — plus the startup migration run
+against the real dev DB, and six new `test_server.py` checks including a
+round-trip through `YoutubeDLCookieJar.load()` itself. **Not visually
+verified:** no browser was available in that session, so the Connections UI
+has never been looked at on a real screen in either theme. That is the open
+item for this feature.
+
 ### v0.4 auth foundation, built this session
 
 Passkeys (WebAuthn) end to end: usernameless registration and login,
@@ -495,16 +519,28 @@ minutes, plus jitter), because a shared-IP rate limit is everyone's problem
 the moment it happens to one job. A completed job resets the backoff.
 State rides along on `/health/extractors` as `circuit_breaker`.
 
-**Encrypted cookie jar.** `PUT/GET/DELETE /me/cookies`. Fernet
-(`cryptography`, already a transitive dep via `webauthn`, now direct)
+**Encrypted cookie jars, one per integration** (v0.9, D-031 — was one jar
+per user in v0.4). `GET /me/cookies`, `PUT/DELETE /me/cookies/{source}`.
+Fernet (`cryptography`, already a transitive dep via `webauthn`, now direct)
 encrypts a Netscape-format cookie export at rest; decrypted only for the
 lifetime of one resolve or download call, written to a temp file (or the
 job's own already-ephemeral scratch dir) and never anywhere else. A key
 rotation degrades a user's cookies to "not configured" rather than raising —
 verified by a test that swaps the encryption key mid-test and confirms the
-old ciphertext just stops decrypting, cleanly. Client: a paste-a-cookies.txt
-textarea in the Account panel, Save/Clear, status only ("configured N ago"),
-never the plaintext back out.
+old ciphertext just stops decrypting, cleanly.
+
+What changed in v0.9 is *what gets stored and what a job can see*. A save is
+filtered to the target source's own domains before encryption, so unrelated
+cookies (the rest of a whole-browser export) are never stored at all; a job
+loads only the jar for the site it is talking to, picked by URL host at
+resolve time and by `sources.extractor` at download time. Expired lines are
+dropped on save — yt-dlp loads with `ignore_expires=True` and would
+otherwise send them — and the soonest surviving expiry is stored so the UI
+can warn before a jar goes stale. The stored format is checked against
+`YoutubeDLCookieJar.load()` itself, not eyeballed. Client: an Account →
+Connections tile grid with per-site instructions, status (`Saved` /
+`Expires in 4d` / `Required` / `Not needed`), Save/Clear — never the
+plaintext back out.
 
 **Multi-device sync (`GET /sync`).** The pull half only — the push half
 needed no new code, since every offline mutation already replays through
@@ -611,6 +647,7 @@ Full reasoning in `08-decisions.md`. Ones that changed the design:
 | D-025 | `X-Content-Type-Options: nosniff` on every response |
 | D-026 | `/sync`'s cursor crashed the endpoint (500) on a well-formed-but-wrong-shaped value — the one place client input got hand-decoded and destructured after Pydantic was done, found by fuzzing rather than reading the code |
 | D-027 | FastAPI's `/docs`, `/redoc`, `/openapi.json` were public with no auth by default — free reconnaissance for an invite-only app; now off unless `PWA_YT_ENABLE_DOCS` is set |
+| D-031 | Cookies are per-integration, not per-user: filtered to one site's domains *before* storage and selected per job, so a YouTube download no longer carries the user's whole browser session. `extract.SOURCES` becomes the single registry `ALLOWED_EXTRACTORS` derives from; the legacy jar migrates itself by domain at startup |
 
 ---
 
